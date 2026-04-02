@@ -6,15 +6,24 @@
 ## The handler is called by nginx for configured routes. It runs
 ## renderToString and writes the output through the nginx output
 ## chain via the OutputStream abstraction.
+##
+## M3 flow:
+##   1. Validate HTTP method (GET/HEAD only, else 405)
+##   2. Validate configuration
+##   3. Look up app renderer by name from config
+##   4. Call the app renderer to get HTML
+##   5. Optionally append hydration script
+##   6. Set Content-Type and Content-Length headers
+##   7. For HEAD requests, return headers only (no body)
+##   8. Write body via the adapter
+##   9. Return appropriate status code
 
 import nginx_types
 import config
 import nginx_adapter
+import app_registry
 
 type
-  AppRenderer* = proc(): string
-    ## Application render function. Returns the HTML string for the page.
-
   RequestInfo* = object
     ## Extracted request information passed to the app.
     uri*: string
@@ -33,14 +42,31 @@ proc handleSsrRequest*(conf: IsoNimLocConf; reqInfo: RequestInfo;
   ## Core SSR handler logic, independent of nginx.
   ## This is testable without nginx headers.
   ##
-  ## 1. Validates configuration
-  ## 2. Calls the app renderer
-  ## 3. Optionally appends hydration script placeholder
-  ## 4. Returns the complete response
+  ## 1. Validates HTTP method
+  ## 2. Validates configuration
+  ## 3. Calls the app renderer
+  ## 4. Optionally appends hydration script placeholder
+  ## 5. Sets Content-Type and Content-Length headers
+  ## 6. For HEAD requests, headers only (empty body)
+  ## 7. Returns the complete response
+
+  # Method validation: only GET and HEAD allowed
+  if reqInfo.httpMethod notin ["GET", "HEAD"]:
+    return HandlerResult(
+      statusCode: NGX_HTTP_NOT_ALLOWED.int,
+      body: "Method Not Allowed",
+    )
+
   if not conf.isValid():
     return HandlerResult(
       statusCode: NGX_HTTP_INTERNAL_SERVER_ERROR.int,
       body: "IsoNim SSR: invalid configuration",
+    )
+
+  if app == nil:
+    return HandlerResult(
+      statusCode: NGX_HTTP_NOT_FOUND.int,
+      body: "IsoNim SSR: app not found",
     )
 
   var html: string
@@ -60,13 +86,17 @@ proc handleSsrRequest*(conf: IsoNimLocConf; reqInfo: RequestInfo;
     script.add ">window._$HY={events:[\"click\",\"input\"],completed:new WeakSet,registry:new Map};</script>"
     html = html & script
 
+  let isHead = reqInfo.httpMethod == "HEAD"
+  let responseBody = if isHead: "" else: html
+
   result = HandlerResult(
     statusCode: NGX_HTTP_OK.int,
     headers: @[
       ("Content-Type", "text/html; charset=utf-8"),
+      ("Content-Length", $html.len),
     ],
-    body: html,
-    chunks: @[html],
+    body: responseBody,
+    chunks: if isHead: @[] else: @[html],
   )
 
 proc handleStreamingSsrRequest*(conf: IsoNimLocConf; reqInfo: RequestInfo;
@@ -75,10 +105,22 @@ proc handleStreamingSsrRequest*(conf: IsoNimLocConf; reqInfo: RequestInfo;
   ## Streaming SSR handler. Renders the app and calls onChunk for each
   ## piece of output. This simulates what the real nginx handler would
   ## do: write each chunk to an ngx_buf_t and flush via output_filter.
+  if reqInfo.httpMethod notin ["GET", "HEAD"]:
+    return HandlerResult(
+      statusCode: NGX_HTTP_NOT_ALLOWED.int,
+      body: "Method Not Allowed",
+    )
+
   if not conf.isValid():
     return HandlerResult(
       statusCode: NGX_HTTP_INTERNAL_SERVER_ERROR.int,
       body: "IsoNim SSR: invalid configuration",
+    )
+
+  if app == nil:
+    return HandlerResult(
+      statusCode: NGX_HTTP_NOT_FOUND.int,
+      body: "IsoNim SSR: app not found",
     )
 
   var chunks: seq[string] = @[]
@@ -125,8 +167,6 @@ when defined(isNginxTest):
   ## output-chain lifecycle.
 
   var
-    testAppRenderer*: AppRenderer = nil
-      ## Tests inject the app renderer here before calling nimHandleRequest.
     testLocConf*: IsoNimLocConf = defaultLocConf()
       ## Tests inject the location config here.
     lastHandlerResult*: HandlerResult
@@ -144,23 +184,29 @@ when defined(isNginxTest):
       {.exportc: "nim_handle_request", cdecl.} =
     ## Called from the C module handler (test mode).
     ##
+    ## M3 flow:
     ## 1. Extract request info from the mock request
-    ## 2. Look up app name from testLocConf
-    ## 3. Create an NginxOutputStream from the mock request
-    ## 4. Run the SSR handler
-    ## 5. Write output through the stream and flush
-    ## 6. Return NGX_OK or the appropriate error code
+    ## 2. Validate HTTP method
+    ## 3. Look up app renderer by name from testLocConf
+    ## 4. Create an NginxOutputStream from the mock request
+    ## 5. Run the SSR handler
+    ## 6. Write output through the stream and flush
+    ## 7. Return NGX_OK or the appropriate error code
     let reqInfo = extractRequestInfo(r)
-
-    if testAppRenderer == nil:
-      return NGX_ERROR
-
     let conf = testLocConf
-    let res = handleSsrRequest(conf, reqInfo, testAppRenderer)
+
+    # Look up app by name from the registry
+    let app = getApp(conf.appName)
+
+    let res = handleSsrRequest(conf, reqInfo, app)
     lastHandlerResult = res
 
     if res.statusCode != NGX_HTTP_OK.int:
       return NgxInt(res.statusCode)
+
+    # For HEAD requests, skip body writing
+    if res.body.len == 0:
+      return NGX_OK
 
     # Create an output stream and write the response body through it.
     let stream = newNginxOutputStream(r)

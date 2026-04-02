@@ -1,10 +1,18 @@
 ## hello.nim
 ##
-## Simple SSR test app: returns a static HTML page.
-## Used for E2E testing of the nginx module.
+## Simple SSR test apps: return static HTML pages.
+## Used for E2E and unit testing of the nginx module.
+
+proc helloApp*(): string =
+  ## Returns a simple hello page for testing.
+  "<html><body><h1>Hello from IsoNim</h1></body></html>"
+
+proc taskManagerApp*(): string =
+  ## Returns a task manager page for testing multiple apps.
+  "<html><body><h1>Task Manager</h1><ul><li>Task 1</li></ul></body></html>"
 
 proc renderHelloApp*(): string =
-  ## Returns a simple HTML page for testing.
+  ## Legacy E2E test app: returns a full HTML page.
   result = """<!DOCTYPE html>
 <html>
 <head><title>Hello from IsoNim</title></head>
