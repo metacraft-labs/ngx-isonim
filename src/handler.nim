@@ -9,9 +9,7 @@
 
 import nginx_types
 import config
-
-when not defined(isNginxTest):
-  import nginx_adapter
+import nginx_adapter
 
 type
   AppRenderer* = proc(): string
@@ -117,9 +115,67 @@ proc handleStreamingSsrRequest*(conf: IsoNimLocConf; reqInfo: RequestInfo;
     chunks: chunks,
   )
 
-when not defined(isNginxTest):
+when defined(isNginxTest):
+  ## Test-mode entry point.  Mirrors the production nimHandleRequest but
+  ## works with MockRequest and the test-mode NginxOutputStream.
+  ##
+  ## The test-mode version extracts URI, method, and headers from the
+  ## mock request, builds an IsoNimLocConf, and runs the SSR handler.
+  ## It also creates an NginxOutputStream so tests can verify the
+  ## output-chain lifecycle.
+
+  var
+    testAppRenderer*: AppRenderer = nil
+      ## Tests inject the app renderer here before calling nimHandleRequest.
+    testLocConf*: IsoNimLocConf = defaultLocConf()
+      ## Tests inject the location config here.
+    lastHandlerResult*: HandlerResult
+      ## After nimHandleRequest runs, the result is stored here for assertions.
+
+  proc extractRequestInfo*(r: NgxHttpRequest): RequestInfo =
+    ## Extract URI, method, and headers from a mock request.
+    RequestInfo(
+      uri: r.uri,
+      httpMethod: r.httpMethod,
+      headers: r.headers,
+    )
+
+  proc nimHandleRequest*(r: NgxHttpRequest): NgxInt
+      {.exportc: "nim_handle_request", cdecl.} =
+    ## Called from the C module handler (test mode).
+    ##
+    ## 1. Extract request info from the mock request
+    ## 2. Look up app name from testLocConf
+    ## 3. Create an NginxOutputStream from the mock request
+    ## 4. Run the SSR handler
+    ## 5. Write output through the stream and flush
+    ## 6. Return NGX_OK or the appropriate error code
+    let reqInfo = extractRequestInfo(r)
+
+    if testAppRenderer == nil:
+      return NGX_ERROR
+
+    let conf = testLocConf
+    let res = handleSsrRequest(conf, reqInfo, testAppRenderer)
+    lastHandlerResult = res
+
+    if res.statusCode != NGX_HTTP_OK.int:
+      return NgxInt(res.statusCode)
+
+    # Create an output stream and write the response body through it.
+    let stream = newNginxOutputStream(r)
+    resetMockState()  # Clear mock counters before our writes.
+
+    stream.write(res.body)
+    stream.flush()
+    stream.close()
+
+    return NGX_OK
+
+else:
   ## Real nginx entry point. Exported as C function for the nginx module.
-  proc nimHandleRequest*(req: NgxHttpRequest): NgxInt {.exportc, cdecl.} =
+  proc nimHandleRequest*(req: NgxHttpRequest): NgxInt
+      {.exportc: "nim_handle_request", cdecl.} =
     ## Called by nginx for configured routes.
     ## In a real deployment, this would:
     ## 1. Extract request info from ngx_http_request_t

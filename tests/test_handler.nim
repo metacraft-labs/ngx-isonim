@@ -5,6 +5,7 @@
 
 import unittest
 import std/strutils
+import ../src/nginx_types
 import ../src/config
 import ../src/handler
 
@@ -177,3 +178,102 @@ suite "Handler - Request Info":
     )
     check res.statusCode == 200
     check res.body == "<html></html>"
+
+
+suite "Handler - C→Nim Bridge (nimHandleRequest)":
+  setup:
+    resetMockState()
+
+  test "nimHandleRequest_returns_NGX_OK_for_valid_request":
+    testLocConf = parseLocConf(
+      enabled = true,
+      appName = "bridge-app",
+      hydrationEnabled = false,
+    )
+    testAppRenderer = proc(): string =
+      "<div>Bridge OK</div>"
+    let req = newMockRequest(uri = "/test", httpMethod = "GET")
+    let rc = nimHandleRequest(req)
+    check rc == NGX_OK
+
+  test "nimHandleRequest_returns_error_for_nil_renderer":
+    testLocConf = parseLocConf(enabled = true, appName = "app")
+    testAppRenderer = nil
+    let req = newMockRequest()
+    let rc = nimHandleRequest(req)
+    check rc == NGX_ERROR
+
+  test "nimHandleRequest_returns_error_for_invalid_config":
+    testLocConf = parseLocConf(enabled = true, appName = "")
+    testAppRenderer = proc(): string = "should not render"
+    let req = newMockRequest()
+    let rc = nimHandleRequest(req)
+    check rc == NGX_HTTP_INTERNAL_SERVER_ERROR
+
+  test "nimHandleRequest_extracts_uri_and_method":
+    testLocConf = parseLocConf(
+      enabled = true,
+      appName = "extract-app",
+      hydrationEnabled = false,
+    )
+    testAppRenderer = proc(): string =
+      "<div>extracted</div>"
+    let req = newMockRequest(uri = "/api/data", httpMethod = "POST")
+    req.headers = @[("Content-Type", "application/json")]
+    let rc = nimHandleRequest(req)
+    check rc == NGX_OK
+    # Verify the handler actually processed the request
+    check lastHandlerResult.statusCode == 200
+    check lastHandlerResult.body.contains("extracted")
+
+  test "nimHandleRequest_extracts_headers_from_mock":
+    testLocConf = parseLocConf(
+      enabled = true,
+      appName = "header-app",
+      hydrationEnabled = false,
+    )
+    testAppRenderer = proc(): string = "<div>headers</div>"
+    let req = newMockRequest(uri = "/")
+    req.headers = @[
+      ("Accept", "text/html"),
+      ("X-Custom", "value"),
+    ]
+    let reqInfo = extractRequestInfo(req)
+    check reqInfo.uri == "/"
+    check reqInfo.httpMethod == "GET"
+    check reqInfo.headers.len == 2
+    check reqInfo.headers[0] == ("Accept", "text/html")
+    check reqInfo.headers[1] == ("X-Custom", "value")
+
+  test "nimHandleRequest_creates_output_stream":
+    testLocConf = parseLocConf(
+      enabled = true,
+      appName = "stream-app",
+      hydrationEnabled = false,
+    )
+    testAppRenderer = proc(): string =
+      "<div>streamed</div>"
+    let req = newMockRequest()
+    resetMockState()
+    let rc = nimHandleRequest(req)
+    check rc == NGX_OK
+    # The handler writes through the NginxOutputStream which calls
+    # ngx_http_output_filter.  Check that the mock recorded the calls.
+    check mockOutputFilterCalls >= 1  # flush + close
+
+  test "nimHandleRequest_response_headers_via_handler_result":
+    testLocConf = parseLocConf(
+      enabled = true,
+      appName = "resp-app",
+      hydrationEnabled = false,
+    )
+    testAppRenderer = proc(): string = "<div>response</div>"
+    let req = newMockRequest()
+    let rc = nimHandleRequest(req)
+    check rc == NGX_OK
+    # Verify the handler result contains the Content-Type header.
+    var foundContentType = false
+    for (k, v) in lastHandlerResult.headers:
+      if k == "Content-Type" and "text/html" in v:
+        foundContentType = true
+    check foundContentType
