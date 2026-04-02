@@ -1,0 +1,12 @@
+nimcache/
+*.so
+*.o
+*.a
+build/
+.direnv/
+result
+result-*
+.env
+tests/test_adapter
+tests/test_handler
+tests/test_config
