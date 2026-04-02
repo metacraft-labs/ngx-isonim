@@ -20,8 +20,16 @@ test:
     nim c -r -d:isNginxTest tests/test_adapter.nim
     nim c -r -d:isNginxTest tests/test_handler.nim
     nim c -r -d:isNginxTest tests/test_config.nim
+    nim c -r -d:isNginxTest tests/test_streaming_handler.nim
 
-# Run E2E tests against real nginx
+# Run E2E integration tests (mock mode, no real nginx needed)
+test-e2e-integration:
+    nim c -r -d:isNginxTest tests/test_e2e_integration.nim
+
+# Run all tests: unit + E2E integration (no real nginx needed)
+test-all: test test-e2e-integration
+
+# Run E2E tests against real nginx (requires nix build .#nginx-with-isonim)
 test-e2e:
     bash tests/e2e/test_e2e.sh
 
@@ -29,4 +37,5 @@ test-e2e:
 clean:
     rm -rf nimcache build
     rm -f tests/test_adapter tests/test_handler tests/test_config
+    rm -f tests/test_streaming_handler tests/test_e2e_integration
     rm -rf tests/nimcache

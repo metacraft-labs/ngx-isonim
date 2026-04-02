@@ -1,11 +1,16 @@
 ## hello.nim
 ##
-## Simple SSR test apps: return static HTML pages.
+## Simple SSR test app: returns static HTML pages.
 ## Used for E2E and unit testing of the nginx module.
 
 proc helloApp*(): string =
   ## Returns a simple hello page for testing.
   "<html><body><h1>Hello from IsoNim</h1></body></html>"
+
+proc helloStreamingApp*(onChunk: proc(chunk: string), onComplete: proc()) =
+  ## Streaming version of the hello app — emits the page in one chunk.
+  onChunk("<html><body><h1>Hello from IsoNim</h1></body></html>")
+  onComplete()
 
 proc taskManagerApp*(): string =
   ## Returns a task manager page for testing multiple apps.
