@@ -18,6 +18,7 @@
 ##   8. Write body via the adapter
 ##   9. Return appropriate status code
 
+import std/times
 import nginx_types
 import config
 import nginx_adapter
@@ -36,6 +37,13 @@ type
     headers*: seq[(string, string)]
     body*: string
     chunks*: seq[string]
+
+  StreamingMetrics* = object
+    ## Timing and size metrics for streaming SSR responses.
+    ttfbMs*: float   ## Time from request start to first flush
+    totalMs*: float  ## Time from request start to close
+    chunkCount*: int ## Number of chunks emitted
+    totalBytes*: int ## Total bytes across all chunks
 
 proc handleSsrRequest*(conf: IsoNimLocConf; reqInfo: RequestInfo;
     app: AppRenderer): HandlerResult =
@@ -155,6 +163,150 @@ proc handleStreamingSsrRequest*(conf: IsoNimLocConf; reqInfo: RequestInfo;
     ],
     body: html,
     chunks: chunks,
+  )
+
+proc handleStreamingRequest*(conf: IsoNimLocConf; reqInfo: RequestInfo;
+    stream: NginxOutputStream;
+    streamingApp: StreamingAppRenderer): tuple[result: HandlerResult, metrics: StreamingMetrics] =
+  ## Streaming SSR handler.
+  ## 1. Validates config, looks up streaming app
+  ## 2. Sets Transfer-Encoding: chunked
+  ## 3. Flushes shell HTML immediately (TTFB)
+  ## 4. Each Suspense boundary resolution flushes a replacement script chunk
+  ## 5. Hydration script appended after all boundaries resolve
+  ## 6. Close stream
+
+  let startTime = cpuTime()
+  var metrics = StreamingMetrics()
+  var firstChunkFlushed = false
+
+  # Method validation: only GET and HEAD allowed
+  if reqInfo.httpMethod notin ["GET", "HEAD"]:
+    let elapsed = (cpuTime() - startTime) * 1000.0
+    metrics.totalMs = elapsed
+    return (
+      result: HandlerResult(
+        statusCode: NGX_HTTP_NOT_ALLOWED.int,
+        body: "Method Not Allowed",
+      ),
+      metrics: metrics,
+    )
+
+  if not conf.isValid():
+    let elapsed = (cpuTime() - startTime) * 1000.0
+    metrics.totalMs = elapsed
+    return (
+      result: HandlerResult(
+        statusCode: NGX_HTTP_INTERNAL_SERVER_ERROR.int,
+        body: "IsoNim SSR: invalid configuration",
+      ),
+      metrics: metrics,
+    )
+
+  if streamingApp == nil:
+    let elapsed = (cpuTime() - startTime) * 1000.0
+    metrics.totalMs = elapsed
+    return (
+      result: HandlerResult(
+        statusCode: NGX_HTTP_NOT_FOUND.int,
+        body: "IsoNim SSR: app not found",
+      ),
+      metrics: metrics,
+    )
+
+  let isHead = reqInfo.httpMethod == "HEAD"
+  var chunks: seq[string] = @[]
+  var totalBody = ""
+  var hadError = false
+
+  proc onChunk(chunk: string) =
+    chunks.add(chunk)
+    totalBody.add(chunk)
+    metrics.chunkCount += 1
+    metrics.totalBytes += chunk.len
+
+    if not isHead:
+      try:
+        stream.write(chunk)
+        stream.flush()
+      except CatchableError:
+        hadError = true
+
+    if not firstChunkFlushed:
+      metrics.ttfbMs = (cpuTime() - startTime) * 1000.0
+      firstChunkFlushed = true
+
+  var completed = false
+  proc onComplete() =
+    completed = true
+
+  try:
+    streamingApp(onChunk, onComplete)
+  except CatchableError:
+    if chunks.len == 0:
+      # Error during shell render — no chunks sent yet
+      let elapsed = (cpuTime() - startTime) * 1000.0
+      metrics.totalMs = elapsed
+      return (
+        result: HandlerResult(
+          statusCode: NGX_HTTP_INTERNAL_SERVER_ERROR.int,
+          body: "IsoNim SSR: render error",
+        ),
+        metrics: metrics,
+      )
+    else:
+      # Error during boundary resolution — partial result + error chunk
+      let errorChunk = "<script>console.error('IsoNim SSR: streaming error during boundary resolution')</script>"
+      chunks.add(errorChunk)
+      totalBody.add(errorChunk)
+      metrics.chunkCount += 1
+      metrics.totalBytes += errorChunk.len
+      if not isHead:
+        try:
+          stream.write(errorChunk)
+          stream.flush()
+        except CatchableError:
+          discard
+
+  # Append hydration script if enabled and we had at least one chunk
+  if conf.hydrationEnabled and chunks.len > 0:
+    var script = "<script"
+    if conf.scriptNonce.len > 0:
+      script.add " nonce=\"" & conf.scriptNonce & "\""
+    script.add ">window._$HY={events:[\"click\",\"input\"],completed:new WeakSet,registry:new Map};</script>"
+    chunks.add(script)
+    totalBody.add(script)
+    metrics.chunkCount += 1
+    metrics.totalBytes += script.len
+    if not isHead:
+      try:
+        stream.write(script)
+        stream.flush()
+      except CatchableError:
+        discard
+
+  # Close the stream
+  if not isHead:
+    try:
+      stream.close()
+    except CatchableError:
+      discard
+
+  metrics.totalMs = (cpuTime() - startTime) * 1000.0
+
+  let headers = @[
+    ("Content-Type", "text/html; charset=utf-8"),
+    ("Transfer-Encoding", "chunked"),
+  ]
+
+  return (
+    result: HandlerResult(
+      statusCode: NGX_HTTP_OK.int,
+      headers: headers,
+      body: if isHead: "" else: totalBody,
+      chunks: if isHead: @[] else: chunks,
+    ),
+    metrics: metrics,
   )
 
 when defined(isNginxTest):
