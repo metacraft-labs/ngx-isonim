@@ -26,6 +26,10 @@ test:
 test-e2e-integration:
     nim c -r -d:isNginxTest tests/test_e2e_integration.nim
 
+# Run IsoNim SSR tests (requires isonim source in ../isonim)
+test-isonim:
+    nim c -r -d:isServer --path:../isonim/src tests/test_isonim_e2e.nim
+
 # Run all tests: unit + E2E integration (no real nginx needed)
 test-all: test test-e2e-integration
 
@@ -38,4 +42,5 @@ clean:
     rm -rf nimcache build
     rm -f tests/test_adapter tests/test_handler tests/test_config
     rm -f tests/test_streaming_handler tests/test_e2e_integration
+    rm -f tests/test_isonim_e2e
     rm -rf tests/nimcache

@@ -8,6 +8,7 @@
   libxcrypt,
   faststreamsPath,
   stewPath,
+  isOnimPath,
 }:
 
 stdenv.mkDerivation {
@@ -41,17 +42,20 @@ stdenv.mkDerivation {
     done
 
     # 1. Compile Nim handler to C
-    #    --path flags provide nim-faststreams and nim-stew (its dependency).
+    #    --path flags provide nim-faststreams, nim-stew, and isonim.
     #    --noMain + --app:lib: no main(), produce a shared library.
     #    --mm:orc: deterministic GC for long-lived nginx workers.
+    #    -d:isServer: enables SSR mode in isonim (buildHtmlString path).
     nim c \
       --mm:orc \
       --noMain \
       --app:lib \
       --nimcache:nimcache \
       -d:asyncBackend=nginx \
+      -d:isServer \
       --path:"${faststreamsPath}" \
       --path:"${stewPath}" \
+      --path:"${isOnimPath}" \
       --passC:"-fPIC" \
       $NGX_NIM_PASSC \
       src/handler.nim

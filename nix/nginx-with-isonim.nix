@@ -36,6 +36,11 @@ let
             isonim_ssr_app hello;
             isonim_ssr_hydration on;
           }
+          location /tasks {
+            isonim_ssr on;
+            isonim_ssr_app tasks;
+            isonim_ssr_hydration on;
+          }
         }
       }
     '';

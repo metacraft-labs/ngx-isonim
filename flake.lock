@@ -18,6 +18,22 @@
         "type": "github"
       }
     },
+    "isonim": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1775145072,
+        "narHash": "sha256-FTDo5wFfnxbjir8MmQ10XNRL/wrEfXuUj2wv6LdRsto=",
+        "owner": "metacraft-labs",
+        "repo": "isonim",
+        "rev": "33ccd33eab9b0855b7354fd984ea89299e83b2fd",
+        "type": "github"
+      },
+      "original": {
+        "owner": "metacraft-labs",
+        "repo": "isonim",
+        "type": "github"
+      }
+    },
     "nim-faststreams": {
       "flake": false,
       "locked": {
@@ -69,6 +85,7 @@
     "root": {
       "inputs": {
         "flake-utils": "flake-utils",
+        "isonim": "isonim",
         "nim-faststreams": "nim-faststreams",
         "nim-stew": "nim-stew",
         "nixpkgs": "nixpkgs"

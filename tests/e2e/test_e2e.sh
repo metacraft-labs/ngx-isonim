@@ -168,12 +168,15 @@ if assert_contains "GET /hello-csp nonce" "${BODY}" 'nonce="abc123"' && \
     pass "GET /hello-csp"
 fi
 
-# Test: GET /tasks
+# Test: GET /tasks (real IsoNim SSR app)
 echo "Test: GET /tasks"
 STATUS=$(curl -s -o /tmp/ngx-isonim-test/tasks_body -w "%{http_code}" "${BASE_URL}/tasks")
 BODY=$(cat /tmp/ngx-isonim-test/tasks_body)
 if assert_status "GET /tasks status" "200" "${STATUS}" && \
-  assert_contains "GET /tasks body" "${BODY}" "Task Manager"; then
+  assert_contains "GET /tasks title" "${BODY}" "IsoNim Task Manager" && \
+  assert_contains "GET /tasks task-list" "${BODY}" "task-list" && \
+  assert_contains "GET /tasks active count" "${BODY}" "3 active" && \
+  assert_contains "GET /tasks hydration" "${BODY}" "window._\$HY"; then
     pass "GET /tasks"
 fi
 

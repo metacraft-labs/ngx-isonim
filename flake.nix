@@ -6,13 +6,17 @@
     flake-utils.url = "github:numtide/flake-utils";
 
     # Nim libraries — pinned to GitHub, overridable locally via .env:
-    #   NIX_FLAKE_OVERRIDE_INPUTS='nim-faststreams=path:../nim-faststreams nim-stew=path:../nim-stew'
+    #   NIX_FLAKE_OVERRIDE_INPUTS='nim-faststreams=path:../nim-faststreams nim-stew=path:../nim-stew isonim=path:../isonim'
     nim-faststreams = {
       url = "github:metacraft-labs/nim-faststreams";
       flake = false;
     };
     nim-stew = {
       url = "github:status-im/nim-stew";
+      flake = false;
+    };
+    isonim = {
+      url = "github:metacraft-labs/isonim";
       flake = false;
     };
   };
@@ -24,6 +28,7 @@
       flake-utils,
       nim-faststreams,
       nim-stew,
+      isonim,
     }:
     flake-utils.lib.eachDefaultSystem (
       system:
@@ -48,13 +53,19 @@
         };
 
         # Nim library paths from flake inputs.
-        # Override locally via .env: NIX_FLAKE_OVERRIDE_INPUTS='nim-faststreams=path:../nim-faststreams nim-stew=path:../nim-stew'
+        # Override locally via .env: NIX_FLAKE_OVERRIDE_INPUTS='nim-faststreams=path:../nim-faststreams nim-stew=path:../nim-stew isonim=path:../isonim'
         faststreamsPath = nim-faststreams;
         stewPath = nim-stew;
+        isOnimPath = "${isonim}/src";
 
         # The .so module derivation.
         ngxIsOnimModule = pkgs.callPackage ./nix/ngx-isonim-module.nix {
-          inherit nginxDevHeaders faststreamsPath stewPath;
+          inherit
+            nginxDevHeaders
+            faststreamsPath
+            stewPath
+            isOnimPath
+            ;
         };
 
         # A complete nginx binary with the module pre-loaded for E2E testing.
