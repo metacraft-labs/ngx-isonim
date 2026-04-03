@@ -23,7 +23,8 @@ when not defined(isNginxTest):
   # This section only compiles when nginx dev headers are available.
   # --------------------------------------------------------------------------
 
-  import faststreams/outputs
+  import faststreams/[outputs, buffers]
+  export outputs
 
   {.pragma: iocall, nimcall, gcsafe, raises: [IOError].}
 
@@ -88,19 +89,18 @@ when not defined(isNginxTest):
 
   const nginxOutputVTable = OutputStreamVTable(
     writeSync: writeNginxSync,
-    writeAsync: nil,
     flushSync: flushNginxSync,
-    flushAsync: nil,
     closeSync: closeNginxSync,
-    closeAsync: nil,
   )
 
-  proc nginxOutput*(req: NgxHttpRequest; pool: NgxPool): OutputStream =
+  proc nginxOutput*(req: NgxHttpRequest; pool: NgxPool;
+                    pageSize = defaultPageSize): OutputStream =
     ## Creates an OutputStream backed by nginx buffer chain.
     ## Each write allocates an ngx_buf_t from the request pool and
     ## appends it to the output chain. Flush calls ngx_http_output_filter.
     NginxOutputStream(
       vtable: vtableAddr nginxOutputVTable,
+      buffers: PageBuffers.init(pageSize),
       request: req,
       pool: pool,
       chainHead: nil,

@@ -18,6 +18,38 @@
         "type": "github"
       }
     },
+    "nim-faststreams": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1775068652,
+        "narHash": "sha256-+UMweprltRyXj8mx8NzOQu2lqLi2SxIkp2lSwBXRl0A=",
+        "owner": "status-im",
+        "repo": "nim-faststreams",
+        "rev": "bef4250709671d953399d6ee4a44bc1105212dd8",
+        "type": "github"
+      },
+      "original": {
+        "owner": "status-im",
+        "repo": "nim-faststreams",
+        "type": "github"
+      }
+    },
+    "nim-stew": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1775036379,
+        "narHash": "sha256-Yvqe4YBxzCHYG/3HkDo9Lq9QJvWXUXrL1AOaYWp5qVc=",
+        "owner": "status-im",
+        "repo": "nim-stew",
+        "rev": "4382b18f04b3c43c8409bfcd6b62063773b2bbaa",
+        "type": "github"
+      },
+      "original": {
+        "owner": "status-im",
+        "repo": "nim-stew",
+        "type": "github"
+      }
+    },
     "nixpkgs": {
       "locked": {
         "lastModified": 1775095191,
@@ -37,6 +69,8 @@
     "root": {
       "inputs": {
         "flake-utils": "flake-utils",
+        "nim-faststreams": "nim-faststreams",
+        "nim-stew": "nim-stew",
         "nixpkgs": "nixpkgs"
       }
     },

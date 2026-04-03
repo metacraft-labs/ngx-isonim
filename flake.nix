@@ -4,6 +4,17 @@
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixpkgs-unstable";
     flake-utils.url = "github:numtide/flake-utils";
+
+    # Nim libraries — pinned to GitHub, overridable locally via .env:
+    #   NIX_FLAKE_OVERRIDE_INPUTS='nim-faststreams=path:../nim-faststreams nim-stew=path:../nim-stew'
+    nim-faststreams = {
+      url = "github:status-im/nim-faststreams";
+      flake = false;
+    };
+    nim-stew = {
+      url = "github:status-im/nim-stew";
+      flake = false;
+    };
   };
 
   outputs =
@@ -11,6 +22,8 @@
       self,
       nixpkgs,
       flake-utils,
+      nim-faststreams,
+      nim-stew,
     }:
     flake-utils.lib.eachDefaultSystem (
       system:
@@ -28,9 +41,14 @@
           inherit nginxSrc;
         };
 
-        # The .so module derivation (placeholder for M0).
+        # Nim library paths from flake inputs.
+        # Override locally via .env: NIX_FLAKE_OVERRIDE_INPUTS='nim-faststreams=path:../nim-faststreams nim-stew=path:../nim-stew'
+        faststreamsPath = nim-faststreams;
+        stewPath = nim-stew;
+
+        # The .so module derivation.
         ngxIsOnimModule = pkgs.callPackage ./nix/ngx-isonim-module.nix {
-          inherit nginxDevHeaders;
+          inherit nginxDevHeaders faststreamsPath stewPath;
         };
 
         # A complete nginx binary with the module pre-loaded for E2E testing.

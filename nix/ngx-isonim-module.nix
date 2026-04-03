@@ -5,6 +5,8 @@
   pcre2,
   openssl,
   zlib,
+  faststreamsPath,
+  stewPath,
 }:
 
 stdenv.mkDerivation {
@@ -22,11 +24,17 @@ stdenv.mkDerivation {
 
   buildPhase = ''
     # 1. Compile Nim handler to C
+    #    --path flags provide nim-faststreams and nim-stew (its dependency).
+    #    --noMain + --app:lib: no main(), produce a shared library.
+    #    --mm:orc: deterministic GC for long-lived nginx workers.
     nim c \
       --mm:orc \
       --noMain \
       --app:lib \
       --nimcache:nimcache \
+      --path:"${faststreamsPath}" \
+      --path:"${stewPath}" \
+      --passC:"-fPIC" \
       --passC:"-I${nginxDevHeaders}/include/nginx/core" \
       --passC:"-I${nginxDevHeaders}/include/nginx/event" \
       --passC:"-I${nginxDevHeaders}/include/nginx/http" \
