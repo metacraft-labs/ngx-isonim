@@ -31,14 +31,20 @@
         pkgs = import nixpkgs { inherit system; };
         isLinux = pkgs.lib.hasSuffix "linux" system;
 
-        # nginx source tree - needed for module compilation headers.
-        nginxSrc = pkgs.nginx.src;
+        # Custom nginx with --with-compat enabled for dynamic module support.
+        # The stock nixpkgs nginx does NOT include --with-compat, so
+        # load_module will reject any .so due to signature mismatch.
+        # We rebuild nginx with the flag added — this is the binary used
+        # for E2E testing and the headers are derived from it.
+        nginxCompat = pkgs.nginx.overrideAttrs (old: {
+          configureFlags = (old.configureFlags or [ ]) ++ [
+            "--with-compat"
+          ];
+        });
 
-        # Configured nginx headers derivation.
-        # Runs ./configure --with-compat on the nginx source to generate
-        # objs/ngx_auto_headers.h and objs/ngx_auto_config.h.
+        # Configured nginx headers derived from the compat build.
         nginxDevHeaders = pkgs.callPackage ./nix/nginx-dev-headers.nix {
-          inherit nginxSrc;
+          nginx = nginxCompat;
         };
 
         # Nim library paths from flake inputs.
@@ -53,6 +59,7 @@
 
         # A complete nginx binary with the module pre-loaded for E2E testing.
         nginxWithIsonim = pkgs.callPackage ./nix/nginx-with-isonim.nix {
+          nginx = nginxCompat;
           inherit ngxIsOnimModule;
         };
       in
@@ -65,7 +72,7 @@
             pkgs.curl
             pkgs.wrk
             pkgs.jq
-            pkgs.nginx
+            nginxCompat
           ]
           ++ pkgs.lib.optionals isLinux [
             pkgs.strace

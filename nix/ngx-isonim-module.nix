@@ -5,6 +5,7 @@
   pcre2,
   openssl,
   zlib,
+  libxcrypt,
   faststreamsPath,
   stewPath,
 }:
@@ -20,9 +21,25 @@ stdenv.mkDerivation {
     pcre2
     openssl
     zlib
+    libxcrypt
   ];
 
   buildPhase = ''
+    # Build -I flags for all nginx header subdirectories.
+    # nginx headers are scattered across src/{core,event,http,os}/... with
+    # nested subdirs (event/quic, http/v2, http/v3, etc.). Rather than
+    # hard-coding each, find all directories containing .h files.
+    NGX_INCLUDES=""
+    for dir in $(find ${nginxDevHeaders}/include/nginx -type f -name '*.h' -printf '%h\n' | sort -u); do
+      NGX_INCLUDES="$NGX_INCLUDES -I$dir"
+    done
+
+    # Build Nim --passC flags from the include dirs
+    NGX_NIM_PASSC=""
+    for dir in $(find ${nginxDevHeaders}/include/nginx -type f -name '*.h' -printf '%h\n' | sort -u); do
+      NGX_NIM_PASSC="$NGX_NIM_PASSC --passC:-I$dir"
+    done
+
     # 1. Compile Nim handler to C
     #    --path flags provide nim-faststreams and nim-stew (its dependency).
     #    --noMain + --app:lib: no main(), produce a shared library.
@@ -35,22 +52,12 @@ stdenv.mkDerivation {
       --path:"${faststreamsPath}" \
       --path:"${stewPath}" \
       --passC:"-fPIC" \
-      --passC:"-I${nginxDevHeaders}/include/nginx/core" \
-      --passC:"-I${nginxDevHeaders}/include/nginx/event" \
-      --passC:"-I${nginxDevHeaders}/include/nginx/http" \
-      --passC:"-I${nginxDevHeaders}/include/nginx/http/modules" \
-      --passC:"-I${nginxDevHeaders}/include/nginx/os/unix" \
-      --passC:"-I${nginxDevHeaders}/include/nginx/objs" \
+      $NGX_NIM_PASSC \
       src/handler.nim
 
     # 2. Compile the C module registration file
     cc -c -fPIC \
-      -I${nginxDevHeaders}/include/nginx/core \
-      -I${nginxDevHeaders}/include/nginx/event \
-      -I${nginxDevHeaders}/include/nginx/http \
-      -I${nginxDevHeaders}/include/nginx/http/modules \
-      -I${nginxDevHeaders}/include/nginx/os/unix \
-      -I${nginxDevHeaders}/include/nginx/objs \
+      $NGX_INCLUDES \
       -o ngx_http_isonim_module.o \
       src/ngx_http_isonim_module.c
 
