@@ -25,10 +25,40 @@
 
 /* ------------------------------------------------------------------ */
 /* Nim entry points — defined in handler.nim, exported as C symbols.  */
+/*                                                                    */
+/* Two rendering paths are available:                                 */
+/*                                                                    */
+/*   1. STREAMING (production):  nim_render_streaming                 */
+/*      Writes HTML directly to the nginx output chain through a      */
+/*      faststreams OutputStream.  No intermediate string copy.       */
+/*      This is the path registered in postconfiguration.             */
+/*                                                                    */
+/*   2. BUFFERED (baseline):  nim_render_app + nim_free_html          */
+/*      Builds the full HTML as a Nim string, copies it to a          */
+/*      C-allocated buffer, then sends it as a single ngx_buf_t.     */
+/*      Kept as a reference for performance comparisons and as a      */
+/*      fallback until the streaming path has more production          */
+/*      mileage.  To switch back, change postconfiguration to         */
+/*      register ngx_http_isonim_handler instead of                   */
+/*      ngx_http_isonim_streaming_handler.                            */
 /* ------------------------------------------------------------------ */
 
 /* Initialize the Nim GC and register default apps. Called once. */
 extern void nim_module_init(void);
+
+/* --- Streaming path (production) ---------------------------------- */
+
+/* Writes HTML directly to the nginx output chain via a faststreams
+ * OutputStream wrapping ngx_buf_t / ngx_http_output_filter.
+ * Headers must be sent before calling.
+ * Returns NGX_OK on success, NGX_ERROR on failure. */
+extern ngx_int_t nim_render_streaming(
+    void *request, void *pool,
+    const char *app_name, int app_name_len,
+    int hydration_enabled,
+    const char *script_nonce, int script_nonce_len);
+
+/* --- Buffered path (baseline for comparison) ---------------------- */
 
 /* Render an app by name. Returns NGX_OK on success and sets *out_html
  * and *out_len.  The caller must free *out_html via nim_free_html(). */
@@ -40,15 +70,6 @@ extern ngx_int_t nim_render_app(
 
 /* Free HTML buffer previously returned by nim_render_app. */
 extern void nim_free_html(char *html);
-
-/* Streaming render: writes directly to the nginx output chain via
- * a faststreams OutputStream.  Headers must be sent before calling.
- * Returns NGX_OK on success, NGX_ERROR on failure. */
-extern ngx_int_t nim_render_streaming(
-    void *request, void *pool,
-    const char *app_name, int app_name_len,
-    int hydration_enabled,
-    const char *script_nonce, int script_nonce_len);
 
 /* Flag to ensure nim_module_init is called exactly once. */
 static int nim_initialized = 0;
@@ -245,13 +266,13 @@ ngx_http_isonim_merge_loc_conf(ngx_conf_t *cf, void *parent, void *child)
 }
 
 /* ------------------------------------------------------------------ */
-/* Content handler.                                                   */
+/* BUFFERED content handler (baseline — kept for comparison).         */
 /*                                                                    */
-/* Registered in the NGX_HTTP_CONTENT_PHASE.  Runs for every request  */
-/* that reaches a location where isonim_ssr is configured.  If the    */
-/* module is disabled for this location we return NGX_DECLINED to let */
-/* the next handler in the phase chain take over.  Otherwise we       */
-/* delegate to the Nim handler which performs the actual SSR.          */
+/* Calls nim_render_app to build the full HTML as a string, then      */
+/* sends it as a single ngx_buf_t with Content-Length.  This is the   */
+/* simpler path but involves an extra string copy.  NOT registered    */
+/* by default — see postconfiguration.  To re-enable, swap the       */
+/* handler pointer in ngx_http_isonim_postconfiguration.              */
 /* ------------------------------------------------------------------ */
 static ngx_int_t
 ngx_http_isonim_handler(ngx_http_request_t *r)
@@ -333,13 +354,17 @@ ngx_http_isonim_handler(ngx_http_request_t *r)
 }
 
 /* ------------------------------------------------------------------ */
-/* Streaming content handler.                                         */
+/* STREAMING content handler (production — registered by default).    */
 /*                                                                    */
-/* Alternative to the buffered handler above.  Sends headers with     */
-/* Transfer-Encoding: chunked (no Content-Length), then calls into    */
-/* Nim which writes chunks directly to the nginx output chain via     */
-/* a faststreams OutputStream wrapping ngx_buf_t/ngx_http_output_    */
-/* filter.  This avoids the intermediate string copy.                 */
+/* Sends headers then calls nim_render_streaming which writes HTML    */
+/* directly to the nginx output chain through a faststreams           */
+/* OutputStream (NginxOutputStream → flushCallback → ngx_buf_t →     */
+/* ngx_http_output_filter).  No intermediate string allocation        */
+/* beyond what the DSL produces.                                      */
+/*                                                                    */
+/* The isonim SSR code (renderToOutputStream) is backend-agnostic —  */
+/* it writes to any faststreams OutputStream.  The nginx adapter      */
+/* is wired in at the ngx-isonim level.                               */
 /* ------------------------------------------------------------------ */
 static ngx_int_t
 ngx_http_isonim_streaming_handler(ngx_http_request_t *r)
@@ -400,9 +425,10 @@ ngx_http_isonim_streaming_handler(ngx_http_request_t *r)
 /* ------------------------------------------------------------------ */
 /* postconfiguration                                                  */
 /*                                                                    */
-/* Called after nginx has finished parsing the config.  We push our   */
-/* handler onto the content phase array so that it runs for matching  */
-/* locations.                                                         */
+/* Registers the content-phase handler.  Currently uses the streaming */
+/* handler (faststreams path).  To switch to the buffered baseline    */
+/* for comparison, change the assignment below to:                    */
+/*   *h = ngx_http_isonim_handler;                                   */
 /* ------------------------------------------------------------------ */
 static ngx_int_t
 ngx_http_isonim_postconfiguration(ngx_conf_t *cf)

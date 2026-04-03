@@ -371,9 +371,17 @@ when defined(isNginxTest):
     return NGX_OK
 
 else:
-  ## Real nginx entry points. The C handler calls nim_render_app to get
-  ## the rendered HTML, then handles all nginx response plumbing in C.
-  ## This avoids complex FFI with opaque nginx structs from Nim.
+  ## Real nginx entry points. Two rendering paths:
+  ##
+  ## 1. STREAMING (production): nim_render_streaming
+  ##    Writes HTML directly to the nginx output chain through a faststreams
+  ##    OutputStream. The isonim SSR code (renderToOutputStream) is
+  ##    backend-agnostic — it works with any faststreams OutputStream.
+  ##
+  ## 2. BUFFERED (baseline): nim_render_app + nim_free_html
+  ##    Builds the full HTML string, copies to a C buffer, returned to the
+  ##    C handler which sends it as a single ngx_buf_t. Kept for performance
+  ##    comparison until the streaming path has more production mileage.
 
   # When compiled with --noMain --app:lib, the Nim runtime (GC, module
   # init code) is not automatically initialized. NimMain() must be called
