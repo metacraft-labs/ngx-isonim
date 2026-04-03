@@ -20,92 +20,77 @@ const
 when not defined(isNginxTest):
   # --------------------------------------------------------------------------
   # Production mode — real faststreams + real nginx C functions.
-  # This section only compiles when nginx dev headers are available.
+  #
+  # Uses the generic nginx_adapters from faststreams, wiring in real
+  # nginx FFI callbacks for buffer allocation and output filtering.
   # --------------------------------------------------------------------------
 
-  import faststreams/[outputs, buffers]
-  export outputs
-
-  {.pragma: iocall, nimcall, gcsafe, raises: [IOError].}
+  import faststreams/[outputs, buffers, nginx_adapters]
+  export outputs, nginx_adapters
 
   type
-    NginxOutputStream* = ref object of OutputStream
+    ## Holds nginx request context alongside the faststreams adapter.
+    NginxRequestContext* = object
       request*: NgxHttpRequest
       pool*: NgxPool
       chainHead*: NgxChain
       chainTail*: NgxChain
 
-  proc appendToChain(ns: NginxOutputStream; buf: NgxBuf) =
+  proc appendToChain(ctx: var NginxRequestContext; buf: NgxBuf) =
     ## Allocate an ngx_chain_t link from the pool and append buf to the chain.
-    let link = cast[NgxChain](ngx_pcalloc(ns.pool, csize_t(sizeof(NgxChainObj))))
+    let link = cast[NgxChain](ngx_pcalloc(ctx.pool, csize_t(sizeof(NgxChainObj))))
     if link.isNil:
       raise newException(IOError, "nginx pool allocation failed for chain link")
     link.buf = buf
     link.next = nil
-    if ns.chainTail != nil:
-      ns.chainTail.next = link
+    if ctx.chainTail != nil:
+      ctx.chainTail.next = link
     else:
-      ns.chainHead = link
-    ns.chainTail = link
-
-  proc writeNginxSync(s: OutputStream; src: pointer; srcLen: Natural)
-      {.iocall.} =
-    let ns = NginxOutputStream(s)
-    if srcLen == 0:
-      return
-    let buf = ngx_create_temp_buf(ns.pool, csize_t(srcLen))
-    if buf.isNil:
-      raise newException(IOError, "nginx pool allocation failed for buffer")
-    copyMem(buf.pos, src, srcLen)
-    buf.last = cast[ptr byte](cast[uint](buf.pos) + uint(srcLen))
-    buf.memory = 1
-    ns.appendToChain(buf)
-
-  proc flushNginxSync(s: OutputStream)
-      {.iocall.} =
-    let ns = NginxOutputStream(s)
-    if ns.chainHead.isNil:
-      return
-    let rc = ngx_http_output_filter(ns.request, ns.chainHead)
-    if rc != NGX_OK:
-      raise newException(IOError, "ngx_http_output_filter failed: " & $rc)
-    ns.chainHead = nil
-    ns.chainTail = nil
-
-  proc closeNginxSync(s: OutputStream)
-      {.iocall.} =
-    let ns = NginxOutputStream(s)
-    # Allocate a final empty buffer with the last_buf flag set.
-    let buf = cast[NgxBuf](ngx_pcalloc(ns.pool, csize_t(sizeof(NgxBufObj))))
-    if buf.isNil:
-      raise newException(IOError, "nginx pool allocation failed for last buf")
-    buf.last_buf = 1
-    ns.appendToChain(buf)
-    let rc = ngx_http_output_filter(ns.request, ns.chainHead)
-    if rc != NGX_OK:
-      raise newException(IOError, "ngx_http_output_filter failed on close: " & $rc)
-    ns.chainHead = nil
-    ns.chainTail = nil
-
-  const nginxOutputVTable = OutputStreamVTable(
-    writeSync: writeNginxSync,
-    flushSync: flushNginxSync,
-    closeSync: closeNginxSync,
-  )
+      ctx.chainHead = link
+    ctx.chainTail = link
 
   proc nginxOutput*(req: NgxHttpRequest; pool: NgxPool;
-                    pageSize = defaultPageSize): OutputStream =
-    ## Creates an OutputStream backed by nginx buffer chain.
-    ## Each write allocates an ngx_buf_t from the request pool and
-    ## appends it to the output chain. Flush calls ngx_http_output_filter.
-    NginxOutputStream(
-      vtable: vtableAddr nginxOutputVTable,
-      buffers: PageBuffers.init(pageSize),
+                    pageSize = defaultPageSize): OutputStreamHandle =
+    ## Creates an OutputStream backed by nginx buffer chain via the
+    ## faststreams nginx adapter. Each flush allocates ngx_buf_t
+    ## entries from the request pool and calls ngx_http_output_filter.
+    var ctx = NginxRequestContext(
       request: req,
       pool: pool,
       chainHead: nil,
       chainTail: nil,
     )
+
+    proc flushCb(data: openArray[byte]) {.gcsafe, raises: [IOError].} =
+      if data.len == 0:
+        return
+      let buf = ngx_create_temp_buf(ctx.pool, csize_t(data.len))
+      if buf.isNil:
+        raise newException(IOError, "nginx pool allocation failed for buffer")
+      copyMem(buf.pos, unsafeAddr data[0], data.len)
+      buf.last = cast[ptr byte](cast[uint](buf.pos) + uint(data.len))
+      buf.memory = 1
+      ctx.appendToChain(buf)
+      let rc = ngx_http_output_filter(ctx.request, ctx.chainHead)
+      if rc != NGX_OK:
+        raise newException(IOError, "ngx_http_output_filter failed: " & $rc)
+      ctx.chainHead = nil
+      ctx.chainTail = nil
+
+    proc closeCb() {.gcsafe, raises: [IOError].} =
+      # Send a final empty buffer with last_buf set.
+      let buf = cast[NgxBuf](ngx_pcalloc(ctx.pool, csize_t(sizeof(NgxBufObj))))
+      if buf.isNil:
+        raise newException(IOError, "nginx pool allocation failed for last buf")
+      buf.last_buf = 1
+      ctx.appendToChain(buf)
+      let rc = ngx_http_output_filter(ctx.request, ctx.chainHead)
+      if rc != NGX_OK:
+        raise newException(IOError, "ngx_http_output_filter failed on close: " & $rc)
+      ctx.chainHead = nil
+      ctx.chainTail = nil
+
+    nginx_adapters.nginxOutput(flushCb, closeCb, pageSize)
 
 else:
   # --------------------------------------------------------------------------

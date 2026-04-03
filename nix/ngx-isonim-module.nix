@@ -49,6 +49,7 @@ stdenv.mkDerivation {
       --noMain \
       --app:lib \
       --nimcache:nimcache \
+      -d:asyncBackend=nginx \
       --path:"${faststreamsPath}" \
       --path:"${stewPath}" \
       --passC:"-fPIC" \
