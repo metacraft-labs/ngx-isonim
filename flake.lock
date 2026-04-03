@@ -21,15 +21,15 @@
     "nim-faststreams": {
       "flake": false,
       "locked": {
-        "lastModified": 1775068652,
-        "narHash": "sha256-+UMweprltRyXj8mx8NzOQu2lqLi2SxIkp2lSwBXRl0A=",
-        "owner": "status-im",
+        "lastModified": 1775206624,
+        "narHash": "sha256-5AT3Je5xpZ4SrXvayqAhUb818IE+n9m/XPOkOuo9KmA=",
+        "owner": "metacraft-labs",
         "repo": "nim-faststreams",
-        "rev": "bef4250709671d953399d6ee4a44bc1105212dd8",
+        "rev": "1ed367648b8faed012e0e9876b342a3bf518c9e5",
         "type": "github"
       },
       "original": {
-        "owner": "status-im",
+        "owner": "metacraft-labs",
         "repo": "nim-faststreams",
         "type": "github"
       }

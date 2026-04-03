@@ -8,7 +8,7 @@
     # Nim libraries — pinned to GitHub, overridable locally via .env:
     #   NIX_FLAKE_OVERRIDE_INPUTS='nim-faststreams=path:../nim-faststreams nim-stew=path:../nim-stew'
     nim-faststreams = {
-      url = "github:status-im/nim-faststreams";
+      url = "github:metacraft-labs/nim-faststreams";
       flake = false;
     };
     nim-stew = {
