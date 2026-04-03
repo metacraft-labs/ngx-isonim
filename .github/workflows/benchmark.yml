@@ -1,0 +1,89 @@
+name: Benchmarks
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  module-benchmarks:
+    name: nginx Module Metrics
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: DeterminateSystems/nix-installer-action@main
+      - uses: DeterminateSystems/magic-nix-cache-action@main
+
+      - name: Build nginx module
+        run: nix build .#module
+
+      - name: Collect module size metrics
+        run: nix develop --command ./scripts/collect-metrics.sh --module > benchmark-results.json
+
+      - name: Show collected metrics
+        run: cat benchmark-results.json
+
+      - name: Store benchmark results
+        if: github.ref == 'refs/heads/main'
+        uses: benchmark-action/github-action-benchmark@v1
+        with:
+          name: "ngx-isonim Module Metrics"
+          tool: customSmallerIsBetter
+          output-file-path: benchmark-results.json
+          gh-pages-branch: gh-pages
+          benchmark-data-dir-path: dev/bench
+          auto-push: true
+          alert-threshold: "120%"
+          comment-on-alert: true
+          fail-on-alert: false
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+  response-benchmarks:
+    name: Response Size Metrics
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: DeterminateSystems/nix-installer-action@main
+      - uses: DeterminateSystems/magic-nix-cache-action@main
+
+      - name: Build nginx with isonim module
+        run: nix build .#nginx-with-isonim
+
+      - name: Start nginx and collect response metrics
+        run: |
+          # Start nginx in background
+          nix run .#test-e2e -- --start-only &
+          NGINX_PID=$!
+
+          # Wait for nginx to be ready
+          for i in $(seq 1 30); do
+            if curl -sf http://localhost:8088/hello > /dev/null 2>&1; then
+              break
+            fi
+            sleep 1
+          done
+
+          # Collect response size metrics
+          nix develop --command ./scripts/collect-metrics.sh --responses > response-results.json
+
+          # Stop nginx
+          kill "$NGINX_PID" 2>/dev/null || true
+          cat response-results.json
+
+      - name: Store response size results
+        if: github.ref == 'refs/heads/main'
+        uses: benchmark-action/github-action-benchmark@v1
+        with:
+          name: "ngx-isonim Response Sizes"
+          tool: customSmallerIsBetter
+          output-file-path: response-results.json
+          gh-pages-branch: gh-pages
+          benchmark-data-dir-path: dev/bench/responses
+          auto-push: true
+          alert-threshold: "120%"
+          comment-on-alert: true
+          fail-on-alert: false
+          github-token: ${{ secrets.GITHUB_TOKEN }}
