@@ -449,3 +449,56 @@ else:
     ## Free an HTML buffer previously returned by nimRenderApp.
     if html != nil:
       dealloc(html)
+
+  when defined(useFaststreams):
+    proc nimRenderStreaming*(req: pointer, pool: pointer,
+                              appName: cstring, appNameLen: cint,
+                              hydration: cint,
+                              nonce: cstring, nonceLen: cint): NgxInt
+        {.exportc: "nim_render_streaming", cdecl.} =
+      ## Streaming render entry point. Called from the C streaming handler
+      ## after headers have been sent. Creates a NginxOutputStream wrapping
+      ## the nginx request and pool, then renders the app directly into it.
+      ##
+      ## The bytes flow: renderToOutputStream -> faststreams write ->
+      ## nginx adapter flushCallback -> ngx_buf_t -> ngx_http_output_filter
+      ## with no intermediate string copy beyond what the DSL produces.
+      ##
+      ## Parameters:
+      ##   req/pool -- opaque pointers to ngx_http_request_t and ngx_pool_t
+      ##   appName/appNameLen -- app name from nginx config
+      ##   hydration -- 1 to append hydration script, 0 to skip
+      ##   nonce/nonceLen -- CSP script nonce (may be NULL/0)
+      ##
+      ## Returns NGX_OK on success, NGX_ERROR on failure.
+
+      # Build Nim strings from (data, len) pairs.
+      var name: string
+      if appNameLen > 0 and appName != nil:
+        name = newString(appNameLen)
+        copyMem(addr name[0], appName, appNameLen)
+      else:
+        name = ""
+
+      var nonceStr: string
+      if nonceLen > 0 and nonce != nil:
+        nonceStr = newString(nonceLen)
+        copyMem(addr nonceStr[0], nonce, nonceLen)
+      else:
+        nonceStr = ""
+
+      # Cast opaque pointers to our nginx types.
+      let ngxReq = cast[NgxHttpRequest](req)
+      let ngxPool = cast[NgxPool](pool)
+
+      # Create a faststreams-backed nginx output stream.
+      let outputHandle = nginxOutput(ngxReq, ngxPool)
+
+      try:
+        renderAppToStream(outputHandle.s, name,
+                          hydration = hydration != 0,
+                          nonce = nonceStr)
+      except CatchableError:
+        return NGX_ERROR
+
+      return NGX_OK

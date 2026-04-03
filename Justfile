@@ -6,6 +6,7 @@ build:
       --mm:orc \
       --noMain \
       --app:lib \
+      -d:useFaststreams \
       --passC:"-I$NGX_DEV_HEADERS/include/nginx/core" \
       --passC:"-I$NGX_DEV_HEADERS/include/nginx/event" \
       --passC:"-I$NGX_DEV_HEADERS/include/nginx/http" \

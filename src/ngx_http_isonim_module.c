@@ -41,6 +41,15 @@ extern ngx_int_t nim_render_app(
 /* Free HTML buffer previously returned by nim_render_app. */
 extern void nim_free_html(char *html);
 
+/* Streaming render: writes directly to the nginx output chain via
+ * a faststreams OutputStream.  Headers must be sent before calling.
+ * Returns NGX_OK on success, NGX_ERROR on failure. */
+extern ngx_int_t nim_render_streaming(
+    void *request, void *pool,
+    const char *app_name, int app_name_len,
+    int hydration_enabled,
+    const char *script_nonce, int script_nonce_len);
+
 /* Flag to ensure nim_module_init is called exactly once. */
 static int nim_initialized = 0;
 
@@ -68,6 +77,7 @@ static char      *ngx_http_isonim_merge_loc_conf(ngx_conf_t *cf,
                       void *parent, void *child);
 static ngx_int_t  ngx_http_isonim_postconfiguration(ngx_conf_t *cf);
 static ngx_int_t  ngx_http_isonim_handler(ngx_http_request_t *r);
+static ngx_int_t  ngx_http_isonim_streaming_handler(ngx_http_request_t *r);
 
 /* ------------------------------------------------------------------ */
 /* Directive table.                                                   */
@@ -323,6 +333,71 @@ ngx_http_isonim_handler(ngx_http_request_t *r)
 }
 
 /* ------------------------------------------------------------------ */
+/* Streaming content handler.                                         */
+/*                                                                    */
+/* Alternative to the buffered handler above.  Sends headers with     */
+/* Transfer-Encoding: chunked (no Content-Length), then calls into    */
+/* Nim which writes chunks directly to the nginx output chain via     */
+/* a faststreams OutputStream wrapping ngx_buf_t/ngx_http_output_    */
+/* filter.  This avoids the intermediate string copy.                 */
+/* ------------------------------------------------------------------ */
+static ngx_int_t
+ngx_http_isonim_streaming_handler(ngx_http_request_t *r)
+{
+    ngx_http_isonim_loc_conf_t *conf;
+    ngx_int_t   rc;
+
+    /* Ensure Nim runtime is initialized. */
+    if (!nim_initialized) {
+        nim_module_init();
+        nim_initialized = 1;
+    }
+
+    /* Retrieve this location's config. */
+    conf = ngx_http_get_module_loc_conf(r, ngx_http_isonim_module);
+
+    if (conf == NULL || !conf->enabled) {
+        return NGX_DECLINED;
+    }
+
+    /* Only handle GET and HEAD. */
+    if (!(r->method & (NGX_HTTP_GET | NGX_HTTP_HEAD))) {
+        return NGX_HTTP_NOT_ALLOWED;
+    }
+
+    /* Discard the request body. */
+    rc = ngx_http_discard_request_body(r);
+    if (rc != NGX_OK) {
+        return rc;
+    }
+
+    /* Send response headers — chunked transfer, no Content-Length. */
+    r->headers_out.status = NGX_HTTP_OK;
+    r->headers_out.content_type_len = sizeof("text/html; charset=utf-8") - 1;
+    ngx_str_set(&r->headers_out.content_type, "text/html; charset=utf-8");
+    /* Do not set content_length_n — nginx will use chunked transfer. */
+
+    rc = ngx_http_send_header(r);
+    if (rc == NGX_ERROR || rc > NGX_OK || r->header_only) {
+        return rc;
+    }
+
+    /* Call Nim to stream render directly into the nginx output chain.
+     * nim_render_streaming creates a NginxOutputStream wrapping (r, pool),
+     * renders the app into it, and flush sends chunks via
+     * ngx_http_output_filter. */
+    rc = nim_render_streaming(
+        (void *)r, (void *)r->pool,
+        (const char *)conf->app_name.data,
+        (int)conf->app_name.len,
+        (int)conf->hydration,
+        (const char *)conf->script_nonce.data,
+        (int)conf->script_nonce.len);
+
+    return rc;
+}
+
+/* ------------------------------------------------------------------ */
 /* postconfiguration                                                  */
 /*                                                                    */
 /* Called after nginx has finished parsing the config.  We push our   */
@@ -342,7 +417,7 @@ ngx_http_isonim_postconfiguration(ngx_conf_t *cf)
         return NGX_ERROR;
     }
 
-    *h = ngx_http_isonim_handler;
+    *h = ngx_http_isonim_streaming_handler;
 
     return NGX_OK;
 }

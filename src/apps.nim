@@ -19,6 +19,9 @@ when not defined(isNginxTest):
   import isonim/ssr/escape
   import isonim/dsl/html
 
+  when defined(useFaststreams):
+    import faststreams/outputs as fsOutputs
+
   type
     Task = object
       id: int
@@ -72,6 +75,15 @@ when not defined(isNginxTest):
       Task(id: 4, text: "Deploy to production", done: false),
       Task(id: 5, text: "Celebrate!", done: false),
     ]
+
+  when defined(useFaststreams):
+    proc renderAppToStream*(output: fsOutputs.OutputStream; appName: string;
+                            hydration: bool; nonce: string) =
+      ## Renders a registered app directly to a faststreams OutputStream.
+      ## Used by the streaming nginx handler to avoid intermediate string copies.
+      let app = getApp(appName)
+      if app != nil:
+        renderToOutputStream(output, app, hydration = hydration, nonce = nonce)
 
   proc registerDefaultApps*() =
     ## Registers the default set of apps for the nginx module.
