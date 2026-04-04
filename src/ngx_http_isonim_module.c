@@ -443,7 +443,11 @@ ngx_http_isonim_postconfiguration(ngx_conf_t *cf)
         return NGX_ERROR;
     }
 
-    *h = ngx_http_isonim_streaming_handler;
+    /* Use buffered handler while streaming handler is investigated.
+     * The streaming handler hangs on the first request — likely an issue
+     * with the faststreams nginx adapter's OutputStreamVTable on C backend.
+     * TODO: debug nim_render_streaming / nginxOutput on C backend. */
+    *h = ngx_http_isonim_handler;
 
     return NGX_OK;
 }
