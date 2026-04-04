@@ -30,13 +30,15 @@ when not defined(isNginxTest):
 
   type
     ## Holds nginx request context alongside the faststreams adapter.
-    NginxRequestContext* = object
+    ## Must be a ref object — closures capture it and outlive the
+    ## factory proc's stack frame.
+    NginxRequestContext* = ref object
       request*: NgxHttpRequest
       pool*: NgxPool
       chainHead*: NgxChain
       chainTail*: NgxChain
 
-  proc appendToChain(ctx: var NginxRequestContext; buf: NgxBuf) =
+  proc appendToChain(ctx: NginxRequestContext; buf: NgxBuf) =
     ## Allocate an ngx_chain_t link from the pool and append buf to the chain.
     let link = cast[NgxChain](ngx_pcalloc(ctx.pool, csize_t(sizeof(NgxChainObj))))
     if link.isNil:
@@ -54,7 +56,7 @@ when not defined(isNginxTest):
     ## Creates an OutputStream backed by nginx buffer chain via the
     ## faststreams nginx adapter. Each flush allocates ngx_buf_t
     ## entries from the request pool and calls ngx_http_output_filter.
-    var ctx = NginxRequestContext(
+    let ctx = NginxRequestContext(
       request: req,
       pool: pool,
       chainHead: nil,

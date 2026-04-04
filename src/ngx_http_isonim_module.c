@@ -400,7 +400,8 @@ ngx_http_isonim_streaming_handler(ngx_http_request_t *r)
     r->headers_out.status = NGX_HTTP_OK;
     r->headers_out.content_type_len = sizeof("text/html; charset=utf-8") - 1;
     ngx_str_set(&r->headers_out.content_type, "text/html; charset=utf-8");
-    /* Do not set content_length_n — nginx will use chunked transfer. */
+    /* Set to -1 to indicate unknown length — nginx uses chunked transfer. */
+    r->headers_out.content_length_n = -1;
 
     rc = ngx_http_send_header(r);
     if (rc == NGX_ERROR || rc > NGX_OK || r->header_only) {
@@ -443,10 +444,9 @@ ngx_http_isonim_postconfiguration(ngx_conf_t *cf)
         return NGX_ERROR;
     }
 
-    /* Use buffered handler while streaming handler is investigated.
-     * The streaming handler hangs on the first request — likely an issue
-     * with the faststreams nginx adapter's OutputStreamVTable on C backend.
-     * TODO: debug nim_render_streaming / nginxOutput on C backend. */
+    /* Streaming handler is under investigation (hangs on first request).
+     * Using buffered handler which works correctly.
+     * To re-enable streaming, change to: ngx_http_isonim_streaming_handler */
     *h = ngx_http_isonim_handler;
 
     return NGX_OK;
