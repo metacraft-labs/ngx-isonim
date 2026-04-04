@@ -68,11 +68,42 @@
             ;
         };
 
+        # Pure C baseline module for performance comparison.
+        baselineModule = pkgs.callPackage ./nix/baseline-module.nix {
+          inherit nginxDevHeaders;
+        };
+
         # A complete nginx binary with the module pre-loaded for E2E testing.
         nginxWithIsonim = pkgs.callPackage ./nix/nginx-with-isonim.nix {
           nginx = nginxCompat;
           inherit ngxIsOnimModule;
         };
+
+        # nginx with baseline module for benchmarking.
+        nginxBaseline =
+          let
+            baselineConf = pkgs.writeTextFile {
+              name = "nginx-baseline.conf";
+              text = ''
+                load_module ${baselineModule}/lib/ngx_http_baseline_module.so;
+                worker_processes 1;
+                error_log /tmp/ngx-baseline-test/error.log;
+                pid /tmp/ngx-baseline-test/nginx.pid;
+                events { worker_connections 256; }
+                http {
+                  access_log off;
+                  server {
+                    listen 8089;
+                    location / { }
+                  }
+                }
+              '';
+            };
+          in
+          pkgs.writeShellScriptBin "nginx-baseline" ''
+            mkdir -p /tmp/ngx-baseline-test
+            exec ${nginxCompat}/bin/nginx -c ${baselineConf} -p /tmp/ngx-baseline-test "$@"
+          '';
       in
       {
         devShells.default = pkgs.mkShell {
@@ -109,7 +140,9 @@
 
         packages = {
           module = ngxIsOnimModule;
+          baseline = baselineModule;
           nginx-with-isonim = nginxWithIsonim;
+          nginx-baseline = nginxBaseline;
           default = ngxIsOnimModule;
         };
 
