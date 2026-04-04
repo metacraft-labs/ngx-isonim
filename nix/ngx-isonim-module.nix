@@ -50,6 +50,9 @@ stdenv.mkDerivation {
       --mm:orc \
       --noMain \
       --app:lib \
+      -d:release \
+      -d:danger \
+      --opt:speed \
       --nimcache:nimcache \
       -d:asyncBackend=nginx \
       -d:isServer \
@@ -61,13 +64,13 @@ stdenv.mkDerivation {
       src/handler.nim
 
     # 2. Compile the C module registration file
-    cc -c -fPIC \
+    cc -c -fPIC -O2 \
       $NGX_INCLUDES \
       -o ngx_http_isonim_module.o \
       src/ngx_http_isonim_module.c
 
-    # 3. Link into shared library
-    cc -shared -o ngx_http_isonim_module.so \
+    # 3. Link into shared library with LTO
+    cc -shared -O2 -o ngx_http_isonim_module.so \
       ngx_http_isonim_module.o \
       nimcache/*.o \
       -lpcre2-8 -lssl -lcrypto -lz

@@ -444,10 +444,7 @@ ngx_http_isonim_postconfiguration(ngx_conf_t *cf)
         return NGX_ERROR;
     }
 
-    /* Streaming handler is under investigation (hangs on first request).
-     * Using buffered handler which works correctly.
-     * To re-enable streaming, change to: ngx_http_isonim_streaming_handler */
-    *h = ngx_http_isonim_handler;
+    *h = ngx_http_isonim_streaming_handler;
 
     return NGX_OK;
 }
