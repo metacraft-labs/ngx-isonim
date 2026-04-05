@@ -1,10 +1,12 @@
-## Profiles each phase of the IsoNim SSR pipeline individually
-## to identify where time is spent in the nginx request handler.
+## SSR Pipeline Profiler
 ##
-## Compile: nim c -d:release -d:danger --opt:speed -d:isServer \
-##          --path:../isonim/src -r benchmarks/ssr_profile.nim
+## Measures each phase of the IsoNim server-side rendering pipeline
+## to identify where time is spent per request.
+##
+## Usage: just profile-ssr
+## Output: terminal summary + benchmarks/results/ssr_profile.json
 
-import std/[times, stats, strformat, strutils]
+import std/[times, stats, strformat, strutils, json, os]
 import isonim/core/[owner, signals, computation]
 import isonim/ssr/[renderer, markers, escape]
 import isonim/dsl/html
@@ -15,6 +17,14 @@ type
     text: string
     done: bool
 
+  PhaseResult = object
+    name: string
+    meanUs: float
+    minUs: float
+    maxUs: float
+    stddevUs: float
+    iterations: int
+
 const taskData: array[5, Task] = [
   Task(id: 1, text: "Learn IsoNim reactive framework", done: true),
   Task(id: 2, text: "Build nginx SSR module", done: true),
@@ -23,34 +33,45 @@ const taskData: array[5, Task] = [
   Task(id: 5, text: "Celebrate!", done: false),
 ]
 
-proc bench(name: string, n: int, body: proc()) =
-  for i in 0 ..< 200: body()  # warmup
+var results: seq[PhaseResult]
+
+proc bench(name: string, n: int, body: proc()): PhaseResult =
+  for i in 0 ..< 500: body()  # warmup
   var rs: RunningStat
   for i in 0 ..< n:
     let t0 = cpuTime()
     body()
     rs.push((cpuTime() - t0) * 1_000_000.0)
-  echo fmt"{name:<45s} {rs.mean:>7.2f} us  (min={rs.min:.2f} max={rs.max:.1f} std={rs.standardDeviation:.1f})"
+  result = PhaseResult(
+    name: name, meanUs: rs.mean, minUs: rs.min,
+    maxUs: rs.max, stddevUs: rs.standardDeviation,
+    iterations: n)
 
-const N = 50_000
+proc printResult(r: PhaseResult) =
+  echo fmt"{r.name:<50s} {r.meanUs:>7.2f} us  (min={r.minUs:.2f}  std={r.stddevUs:.1f})"
 
-echo "=== SSR Pipeline Profiling (", N, " iterations, -d:release -d:danger) ==="
+let N = parseInt(getEnv("BENCH_N", "50000"))
+
+echo "=== SSR Pipeline Profile ==="
+echo fmt"iterations: {N}   flags: -d:release -d:danger --opt:speed"
 echo ""
 
-bench("1. resetHydrationCounter", N):
-  resetHydrationCounter()
+results.add bench("1. resetHydrationCounter", N, proc() =
+  resetHydrationCounter())
+printResult(results[^1])
 
-bench("2. createRoot + dispose (empty)", N):
-  createRoot proc(dispose: proc()) =
-    dispose()
+results.add bench("2. createRoot + dispose (empty)", N, proc() =
+  createRoot proc(dispose: proc()) = dispose())
+printResult(results[^1])
 
-bench("3. createRoot + 1 signal + dispose", N):
+results.add bench("3. createRoot + 1 signal + dispose", N, proc() =
   createRoot proc(dispose: proc()) =
     let s = createSignal(0)
     discard s.val
-    dispose()
+    dispose())
+printResult(results[^1])
 
-bench("4. createRoot + signal + memo + dispose", N):
+results.add bench("4. createRoot + signal + memo + dispose", N, proc() =
   createRoot proc(dispose: proc()) =
     let ts = createSignal(@taskData)
     let ac = createMemo proc(): int =
@@ -59,9 +80,10 @@ bench("4. createRoot + signal + memo + dispose", N):
         if not t.done: inc c
       c
     discard ac.val
-    dispose()
+    dispose())
+printResult(results[^1])
 
-bench("5. buildHtmlString (static, no signals)", N):
+results.add bench("5. buildHtmlString (static, no signals)", N, proc() =
   discard buildHtmlString:
     tdiv(class = "app"):
       header: h1: text "Title"
@@ -69,9 +91,10 @@ bench("5. buildHtmlString (static, no signals)", N):
         li: text "Item 1"
         li: text "Item 2"
         li: text "Item 3"
-      footer: p: text "Footer"
+      footer: p: text "Footer")
+printResult(results[^1])
 
-bench("6. buildHtmlString (5 items, forIn)", N):
+results.add bench("6. buildHtmlString (5 items, forIn)", N, proc() =
   let ts = @taskData
   discard buildHtmlString:
     ul(class = "task-list"):
@@ -79,9 +102,10 @@ bench("6. buildHtmlString (5 items, forIn)", N):
         li(class = if item.done: "task completed" else: "task"):
           input(`type` = "checkbox", checked = $item.done)
           span(class = "task-text"): text item.text
-          button(class = "remove"): text "x"
+          button(class = "remove"): text "x")
+printResult(results[^1])
 
-bench("7. renderToString (full task app)", N):
+results.add bench("7. renderToString (full task app)", N, proc() =
   discard renderToString proc(): string =
     let ts = createSignal(@taskData)
     let ac = createMemo proc(): int =
@@ -105,13 +129,14 @@ bench("7. renderToString (full task app)", N):
                 span(class = "task-text"): text item.text
                 button(class = "remove"): text "x"
         footer(class = "app-footer"):
-          p: text "Powered by IsoNim + nginx"
+          p: text "Powered by IsoNim + nginx")
+printResult(results[^1])
 
-bench("8. generateHydrationScript", N):
-  discard generateHydrationScript()
+results.add bench("8. generateHydrationScript", N, proc() =
+  discard generateHydrationScript())
+printResult(results[^1])
 
-# Simulate the full handler pipeline
-bench("9. FULL: render + hydration + alloc/copy", N):
+results.add bench("9. FULL: render + hydration + alloc/copy", N, proc() =
   let rendered = renderToString(proc(): string =
     let ts = createSignal(@taskData)
     let ac = createMemo proc(): int =
@@ -139,15 +164,60 @@ bench("9. FULL: render + hydration + alloc/copy", N):
   ) & generateHydrationScript()
   let buf = alloc(rendered.len + 1)
   copyMem(buf, unsafeAddr rendered[0], rendered.len)
-  dealloc(buf)
+  dealloc(buf))
+printResult(results[^1])
+
+# Output size info
+let sample = renderToString(proc(): string =
+  let ts = createSignal(@taskData)
+  let ac = createMemo proc(): int =
+    var c = 0
+    for t in ts.val:
+      if not t.done: inc c
+    c
+  buildHtmlString:
+    tdiv(class = "app"):
+      header(class = "page-header"):
+        h1: text "IsoNim Task Manager"
+        p(class = "subtitle"): text "Served by nginx + IsoNim SSR"
+      section(class = "task-section"):
+        tdiv(class = "task-header"):
+          h2: text "Tasks"
+          span(class = "count"): text $ac.val & " active"
+        ul(class = "task-list"):
+          forIn(ts.val):
+            li(class = if item.done: "task completed" else: "task"):
+              input(`type` = "checkbox", checked = $item.done)
+              span(class = "task-text"): text item.text
+              button(class = "remove"): text "x"
+      footer(class = "app-footer"):
+        p: text "Powered by IsoNim + nginx"
+) & generateHydrationScript()
 
 echo ""
-echo "=== Summary ==="
-echo "Phases 1-4: reactive scope setup/teardown"
-echo "Phases 5-6: HTML string generation"
-echo "Phase 7:    full SSR render (1+2+3+4+5+6 combined)"
-echo "Phase 8:    hydration script"
-echo "Phase 9:    full handler pipeline (7+8+alloc/copy)"
+echo fmt"HTML output: {sample.len} bytes"
+echo fmt"Theoretical max: {(1_000_000.0 / results[^1].meanUs).int} req/s (1 / phase 9)"
 echo ""
-echo "nginx overhead = wrk latency - phase 9 mean"
-echo "(accounts for TCP, HTTP parsing, output filter, etc.)"
+
+# Write JSON results
+let outDir = "benchmarks/results"
+createDir(outDir)
+var jResults = newJArray()
+for r in results:
+  jResults.add(%*{
+    "name": r.name,
+    "mean_us": r.meanUs,
+    "min_us": r.minUs,
+    "max_us": r.maxUs,
+    "stddev_us": r.stddevUs,
+    "iterations": r.iterations,
+  })
+let jDoc = %*{
+  "type": "ssr_profile",
+  "timestamp": $now(),
+  "iterations": N,
+  "html_bytes": sample.len,
+  "phases": jResults,
+}
+writeFile(outDir / "ssr_profile.json", $jDoc)
+echo fmt"Detailed results: {outDir}/ssr_profile.json"

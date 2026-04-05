@@ -1,0 +1,80 @@
+{
+  "type": "ssr_profile",
+  "timestamp": "2026-04-05T07:08:33+03:00",
+  "iterations": 50000,
+  "html_bytes": 1497,
+  "phases": [
+    {
+      "name": "1. resetHydrationCounter",
+      "mean_us": 0.14930222000000257,
+      "min_us": 0.0,
+      "max_us": 66.57300000000032,
+      "stddev_us": 0.3648181791565143,
+      "iterations": 50000
+    },
+    {
+      "name": "2. createRoot + dispose (empty)",
+      "mean_us": 0.23214240000001035,
+      "min_us": 0.0,
+      "max_us": 6.395999999998791,
+      "stddev_us": 0.1059267649002864,
+      "iterations": 50000
+    },
+    {
+      "name": "3. createRoot + 1 signal + dispose",
+      "mean_us": 0.27738873999998687,
+      "min_us": 0.0,
+      "max_us": 7.824000000003495,
+      "stddev_us": 0.1127239473280367,
+      "iterations": 50000
+    },
+    {
+      "name": "4. createRoot + signal + memo + dispose",
+      "mean_us": 0.8543728800000358,
+      "min_us": 0.0,
+      "max_us": 23.656999999996376,
+      "stddev_us": 1.244367595624611,
+      "iterations": 50000
+    },
+    {
+      "name": "5. buildHtmlString (static, no signals)",
+      "mean_us": 0.41834326000001276,
+      "min_us": 0.0,
+      "max_us": 25.438000000002624,
+      "stddev_us": 0.20177929099033293,
+      "iterations": 50000
+    },
+    {
+      "name": "6. buildHtmlString (5 items, forIn)",
+      "mean_us": 1.9112807999999506,
+      "min_us": 0.0,
+      "max_us": 26.255000000002802,
+      "stddev_us": 0.3196851395847142,
+      "iterations": 50000
+    },
+    {
+      "name": "7. renderToString (full task app)",
+      "mean_us": 3.259758340000214,
+      "min_us": 0.46200000003437935,
+      "max_us": 19.36099999999552,
+      "stddev_us": 1.3138474810345866,
+      "iterations": 50000
+    },
+    {
+      "name": "8. generateHydrationScript",
+      "mean_us": 0.3006606200001262,
+      "min_us": 0.0,
+      "max_us": 9.107000000008192,
+      "stddev_us": 0.12441852450982069,
+      "iterations": 50000
+    },
+    {
+      "name": "9. FULL: render + hydration + alloc/copy",
+      "mean_us": 3.5942107800000413,
+      "min_us": 0.0,
+      "max_us": 19.59200000001271,
+      "stddev_us": 1.3384676566402494,
+      "iterations": 50000
+    }
+  ]
+}
