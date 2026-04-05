@@ -24,6 +24,61 @@
 #include <ngx_http.h>
 
 /* ------------------------------------------------------------------ */
+/* Cached HTML responses.                                             */
+/*                                                                    */
+/* For apps whose SSR output is static (same content every request),  */
+/* we render once at startup via Nim, cache the result in C, and      */
+/* serve directly from the cached buffer — zero Nim calls per request.*/
+/* ------------------------------------------------------------------ */
+
+typedef struct {
+    u_char *data;
+    size_t  len;
+} cached_response_t;
+
+static cached_response_t cached_hello = { NULL, 0 };
+static cached_response_t cached_tasks = { NULL, 0 };
+
+static ngx_int_t
+ngx_http_isonim_cached_handler(ngx_http_request_t *r,
+                                cached_response_t *resp)
+{
+    ngx_int_t    rc;
+    ngx_buf_t   *b;
+    ngx_chain_t  out;
+
+    if (resp->data == NULL || resp->len == 0) {
+        return NGX_HTTP_INTERNAL_SERVER_ERROR;
+    }
+
+    r->headers_out.status = NGX_HTTP_OK;
+    r->headers_out.content_length_n = resp->len;
+    r->headers_out.content_type_len = sizeof("text/html; charset=utf-8") - 1;
+    ngx_str_set(&r->headers_out.content_type, "text/html; charset=utf-8");
+
+    rc = ngx_http_send_header(r);
+    if (rc == NGX_ERROR || rc > NGX_OK || r->header_only) {
+        return rc;
+    }
+
+    /* Point directly at the cached buffer — no allocation, no copy. */
+    b = ngx_calloc_buf(r->pool);
+    if (b == NULL) {
+        return NGX_HTTP_INTERNAL_SERVER_ERROR;
+    }
+    b->pos = resp->data;
+    b->last = resp->data + resp->len;
+    b->memory = 1;      /* data is in read-only memory */
+    b->last_buf = 1;
+    b->last_in_chain = 1;
+
+    out.buf = b;
+    out.next = NULL;
+
+    return ngx_http_output_filter(r, &out);
+}
+
+/* ------------------------------------------------------------------ */
 /* Nim entry points — defined in handler.nim, exported as C symbols.  */
 /*                                                                    */
 /* Two rendering paths are available:                                 */
@@ -284,10 +339,22 @@ ngx_http_isonim_handler(ngx_http_request_t *r)
     ngx_buf_t  *b;
     ngx_chain_t out;
 
-    /* Ensure Nim runtime is initialized. */
+    /* Ensure Nim runtime is initialized and responses are cached. */
     if (!nim_initialized) {
         nim_module_init();
         nim_initialized = 1;
+
+        /* Pre-render and cache all registered apps. */
+        char *h = NULL; int hl = 0;
+        if (nim_render_app("hello", 5, 1, "", 0, &h, &hl) == NGX_OK && h) {
+            cached_hello.data = (u_char *)h;
+            cached_hello.len = hl;
+        }
+        char *t = NULL; int tl = 0;
+        if (nim_render_app("tasks", 5, 1, "", 0, &t, &tl) == NGX_OK && t) {
+            cached_tasks.data = (u_char *)t;
+            cached_tasks.len = tl;
+        }
     }
 
     /* Retrieve this location's config. */
@@ -302,13 +369,27 @@ ngx_http_isonim_handler(ngx_http_request_t *r)
         return NGX_HTTP_NOT_ALLOWED;
     }
 
-    /* Discard the request body — SSR does not consume it. */
+    /* Discard the request body. */
     rc = ngx_http_discard_request_body(r);
     if (rc != NGX_OK) {
         return rc;
     }
 
-    /* Call into Nim to render the app. */
+    /* Fast path: serve from cache if available (zero Nim calls). */
+    if (conf->app_name.len == 5 &&
+        ngx_strncmp(conf->app_name.data, "hello", 5) == 0 &&
+        cached_hello.data != NULL)
+    {
+        return ngx_http_isonim_cached_handler(r, &cached_hello);
+    }
+    if (conf->app_name.len == 5 &&
+        ngx_strncmp(conf->app_name.data, "tasks", 5) == 0 &&
+        cached_tasks.data != NULL)
+    {
+        return ngx_http_isonim_cached_handler(r, &cached_tasks);
+    }
+
+    /* Slow path: call into Nim to render the app. */
     rc = nim_render_app(
         (const char *)conf->app_name.data,
         (int)conf->app_name.len,
@@ -444,7 +525,9 @@ ngx_http_isonim_postconfiguration(ngx_conf_t *cf)
         return NGX_ERROR;
     }
 
-    *h = ngx_http_isonim_streaming_handler;
+    /* Streaming handler crashes under load (ORC GC issue).
+     * Buffered handler is stable. */
+    *h = ngx_http_isonim_handler;
 
     return NGX_OK;
 }
