@@ -94,12 +94,9 @@ when not defined(isNginxTest):
       "<html><body><h1>Hello from IsoNim</h1></body></html>"
     )
 
-    # Real IsoNim SSR task manager app — pre-rendered at startup.
-    # For apps with static content (no per-request state), rendering
-    # once eliminates the ORC GC overhead from createRoot/dispose on
-    # every request. For dynamic content, the app closure would call
-    # renderTaskApp with per-request data.
-    let cachedTaskHtml = renderTaskApp(defaultTasks())
+    # Real IsoNim SSR task manager app — renders on every request.
+    # In production, the app would receive per-request data (query params,
+    # session state, database results) and render dynamically.
     registerApp("tasks", proc(): string =
-      cachedTaskHtml
+      renderTaskApp(defaultTasks())
     )
