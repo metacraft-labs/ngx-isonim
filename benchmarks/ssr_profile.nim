@@ -9,7 +9,7 @@
 import std/[times, stats, strformat, strutils, json, os]
 import isonim/core/[owner, signals, computation]
 import isonim/ssr/[renderer, markers, escape]
-import isonim/dsl/html
+import isonim/dsl/ui
 
 type
   Task = object

@@ -17,7 +17,7 @@ when not defined(isNginxTest):
   import isonim/ssr/renderer
   import isonim/ssr/markers
   import isonim/ssr/escape
-  import isonim/dsl/html
+  import isonim/dsl/ui
 
   when defined(useFaststreams):
     import faststreams/outputs as fsOutputs

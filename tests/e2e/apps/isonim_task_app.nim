@@ -8,7 +8,7 @@ import isonim/core/computation
 import isonim/ssr/renderer
 import isonim/ssr/markers
 import isonim/ssr/escape
-import isonim/dsl/html
+import isonim/dsl/ui
 
 type
   Task* = object
