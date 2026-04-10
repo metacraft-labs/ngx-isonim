@@ -83,8 +83,8 @@ results.add bench("4. createRoot + signal + memo + dispose", N, proc() =
     dispose())
 printResult(results[^1])
 
-results.add bench("5. buildHtmlString (static, no signals)", N, proc() =
-  discard buildHtmlString:
+results.add bench("5. uiString (static, no signals)", N, proc() =
+  discard uiString:
     tdiv(class = "app"):
       header: h1: text "Title"
       section: ul:
@@ -94,9 +94,9 @@ results.add bench("5. buildHtmlString (static, no signals)", N, proc() =
       footer: p: text "Footer")
 printResult(results[^1])
 
-results.add bench("6. buildHtmlString (5 items, forIn)", N, proc() =
+results.add bench("6. uiString (5 items, forIn)", N, proc() =
   let ts = @taskData
-  discard buildHtmlString:
+  discard uiString:
     ul(class = "task-list"):
       forIn(ts):
         li(class = if item.done: "task completed" else: "task"):
@@ -113,7 +113,7 @@ results.add bench("7. renderToString (full task app)", N, proc() =
       for t in ts.val:
         if not t.done: inc c
       c
-    buildHtmlString:
+    uiString:
       tdiv(class = "app"):
         header(class = "page-header"):
           h1: text "IsoNim Task Manager"
@@ -144,7 +144,7 @@ results.add bench("9. FULL: render + hydration + alloc/copy", N, proc() =
       for t in ts.val:
         if not t.done: inc c
       c
-    buildHtmlString:
+    uiString:
       tdiv(class = "app"):
         header(class = "page-header"):
           h1: text "IsoNim Task Manager"
@@ -175,7 +175,7 @@ let sample = renderToString(proc(): string =
     for t in ts.val:
       if not t.done: inc c
     c
-  buildHtmlString:
+  uiString:
     tdiv(class = "app"):
       header(class = "page-header"):
         h1: text "IsoNim Task Manager"

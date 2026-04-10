@@ -28,7 +28,7 @@ proc renderTaskApp*(tasks: seq[Task]): string =
         if not t.done: inc count
       count
 
-    buildHtmlString:
+    uiString:
       tdiv(class = "app"):
         header(class = "page-header"):
           h1: text "IsoNim Task Manager"
