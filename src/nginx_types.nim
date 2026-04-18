@@ -34,6 +34,22 @@ when not defined(isNginxTest):
       next* {.importc: "next".}: NgxChain
     NgxChain* = ptr NgxChainObj
 
+    NgxStrObj* {.importc: "ngx_str_t", header: "<ngx_core.h>".} = object
+      len* {.importc: "len".}: csize_t
+      data* {.importc: "data".}: ptr byte
+    NgxStr* = NgxStrObj
+
+    NgxTableEltObj* {.importc: "ngx_table_elt_t", header: "<ngx_http.h>".} = object
+      key* {.importc: "key".}: NgxStr
+      value* {.importc: "value".}: NgxStr
+    NgxTableElt* = ptr NgxTableEltObj
+
+    NgxListPartObj* {.importc: "ngx_list_part_t", header: "<ngx_core.h>".} = object
+      elts* {.importc: "elts".}: pointer
+      nelts* {.importc: "nelts".}: cuint
+      next* {.importc: "next".}: NgxListPart
+    NgxListPart* = ptr NgxListPartObj
+
     NgxHttpRequestObj {.importc: "ngx_http_request_t",
         header: "<ngx_http.h>", incompleteStruct.} = object
     NgxHttpRequest* = ptr NgxHttpRequestObj
@@ -89,18 +105,34 @@ else:
         ## When true, the next allocation returns nil / raises, simulating
         ## pool exhaustion.
 
+    MockNgxStr* = object
+      data*: ptr byte
+      len*: int
+
+    MockTableElt* = object
+      key*: MockNgxStr
+      value*: MockNgxStr
+
+    MockListPart* = ref object
+      elts*: seq[MockTableElt]
+      next*: MockListPart
+
     MockRequest* = ref object
       ## Mock nginx request.
       pool*: MockPool
       uri*: string
       httpMethod*: string
       headers*: seq[(string, string)]
+      headerParts*: MockListPart
 
     # Type aliases matching the real API names.
     NgxPool* = MockPool
     NgxBuf* = MockBuf
     NgxChain* = MockChainLink
     NgxHttpRequest* = MockRequest
+    NgxStr* = MockNgxStr
+    NgxTableElt* = ptr MockTableElt
+    NgxListPart* = MockListPart
 
   proc newMockPool*(): MockPool =
     MockPool(allocations: 0, failNextAlloc: false)
