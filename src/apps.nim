@@ -31,10 +31,10 @@ when not defined(isNginxTest):
   proc renderTaskApp(tasks: seq[Task]): string =
     ## Renders the task manager app to an HTML string using the IsoNim
     ## reactive core, DSL, and SSR renderer.
-    renderToString proc(): string =
+    renderToString do () -> string:
       var taskSignal = createSignal(tasks)
 
-      let activeCount = createMemo proc(): int =
+      let activeCount = createMemo do () -> int:
         var count = 0
         for t in taskSignal.val:
           if not t.done: inc count

@@ -18,11 +18,11 @@ type
 
 proc renderTaskApp*(tasks: seq[Task]): string =
   ## Renders the task manager app to an HTML string with hydration markers.
-  renderToString proc(): string =
+  renderToString do () -> string:
     var taskSignal = createSignal(tasks)
     var filter = createSignal("all")
 
-    let activeCount = createMemo proc(): int =
+    let activeCount = createMemo do () -> int:
       var count = 0
       for t in taskSignal.val:
         if not t.done: inc count
