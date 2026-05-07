@@ -28,7 +28,7 @@ proc renderTaskApp*(tasks: seq[Task]): string =
         if not t.done: inc count
       count
 
-    uiString:
+    ui:
       tdiv(class = "app"):
         header(class = "page-header"):
           h1: text "IsoNim Task Manager"
@@ -42,14 +42,14 @@ proc renderTaskApp*(tasks: seq[Task]): string =
               text $activeCount.val & " active"
 
           ul(class = "task-list"):
-            forIn(taskSignal.val):
+            for item in taskSignal.val:
               li(class = if item.done: "task completed" else: "task"):
                 input(`type` = "checkbox", checked = $item.done)
                 span(class = "task-text"):
                   text item.text
                 button(class = "remove"): text "x"
 
-          showIf(taskSignal.val.len == 0):
+          if taskSignal.val.len == 0:
             p(class = "empty-state"): text "No tasks yet"
 
         footer(class = "app-footer"):

@@ -253,7 +253,7 @@ To register a new SSR app, edit `src/apps.nim`:
 registerApp("my_app", proc(): string =
   # Use IsoNim reactive primitives and DSL here
   renderToString proc(): string =
-    uiString:
+    ui:
       tdiv(class = "my-app"):
         h1: text "My New App"
 )
