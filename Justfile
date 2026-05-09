@@ -20,11 +20,11 @@ build:
 
 # Build via Nix (produces result/lib/ngx_http_isonim_module.so)
 build-nix:
-    nix build .#module --override-input nim-faststreams path:../nim-faststreams --override-input isonim path:../isonim
+    nix build .#module --override-input nim-faststreams path:../nim-faststreams --override-input isonim path:../isonim --override-input nim-everywhere path:../nim-everywhere
 
 # Build nginx-with-isonim wrapper
 build-nginx:
-    nix build .#nginx-with-isonim --override-input nim-faststreams path:../nim-faststreams --override-input isonim path:../isonim -o result-nginx
+    nix build .#nginx-with-isonim --override-input nim-faststreams path:../nim-faststreams --override-input isonim path:../isonim --override-input nim-everywhere path:../nim-everywhere -o result-nginx
 
 # Build baseline module
 build-baseline:
@@ -45,7 +45,7 @@ test-e2e-integration:
 
 # Run IsoNim SSR tests (requires ../isonim)
 test-isonim:
-    nim c -r -d:isServer -d:asyncBackend=none --path:../isonim/src --path:../nim-faststreams --path:../nim-stew tests/test_isonim_e2e.nim
+    nim c -r -d:isServer -d:asyncBackend=none --path:../isonim/src --path:../nim-everywhere/src --path:../nim-faststreams --path:../nim-stew tests/test_isonim_e2e.nim
 
 # Run all tests
 test-all: test test-e2e-integration
@@ -83,7 +83,7 @@ stop:
 profile-ssr:
     @mkdir -p benchmarks/results
     nim c -d:release -d:danger --opt:speed -d:isServer -d:asyncBackend=none \
-      --path:../isonim/src --path:../nim-faststreams --path:../nim-stew \
+      --path:../isonim/src --path:../nim-everywhere/src --path:../nim-faststreams --path:../nim-stew \
       -o:benchmarks/ssr_profile \
       benchmarks/ssr_profile.nim
     benchmarks/ssr_profile

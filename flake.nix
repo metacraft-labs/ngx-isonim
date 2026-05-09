@@ -6,7 +6,7 @@
     flake-utils.url = "github:numtide/flake-utils";
 
     # Nim libraries — pinned to GitHub, overridable locally via .env:
-    #   NIX_FLAKE_OVERRIDE_INPUTS='nim-faststreams=path:../nim-faststreams nim-stew=path:../nim-stew isonim=path:../isonim'
+    #   NIX_FLAKE_OVERRIDE_INPUTS='nim-faststreams=path:../nim-faststreams nim-stew=path:../nim-stew isonim=path:../isonim nim-everywhere=path:../nim-everywhere'
     nim-faststreams = {
       url = "github:metacraft-labs/nim-faststreams";
       flake = false;
@@ -19,6 +19,10 @@
       url = "github:metacraft-labs/isonim";
       flake = false;
     };
+    nim-everywhere = {
+      url = "github:metacraft-labs/nim-everywhere";
+      flake = false;
+    };
   };
 
   outputs =
@@ -29,6 +33,7 @@
       nim-faststreams,
       nim-stew,
       isonim,
+      nim-everywhere,
     }:
     flake-utils.lib.eachDefaultSystem (
       system:
@@ -53,10 +58,11 @@
         };
 
         # Nim library paths from flake inputs.
-        # Override locally via .env: NIX_FLAKE_OVERRIDE_INPUTS='nim-faststreams=path:../nim-faststreams nim-stew=path:../nim-stew isonim=path:../isonim'
+        # Override locally via .env: NIX_FLAKE_OVERRIDE_INPUTS='nim-faststreams=path:../nim-faststreams nim-stew=path:../nim-stew isonim=path:../isonim nim-everywhere=path:../nim-everywhere'
         faststreamsPath = nim-faststreams;
         stewPath = nim-stew;
         isOnimPath = "${isonim}/src";
+        nimEverywherePath = "${nim-everywhere}/src";
 
         # The .so module derivation.
         ngxIsOnimModule = pkgs.callPackage ./nix/ngx-isonim-module.nix {
@@ -65,6 +71,7 @@
             faststreamsPath
             stewPath
             isOnimPath
+            nimEverywherePath
             ;
         };
 

@@ -9,6 +9,7 @@
   faststreamsPath,
   stewPath,
   isOnimPath,
+  nimEverywherePath,
 }:
 
 stdenv.mkDerivation {
@@ -42,7 +43,7 @@ stdenv.mkDerivation {
     done
 
     # 1. Compile Nim handler to C
-    #    --path flags provide nim-faststreams, nim-stew, and isonim.
+    #    --path flags provide nim-faststreams, nim-stew, isonim, and nim-everywhere.
     #    --noMain + --app:lib: no main(), produce a shared library.
     #    --mm:orc: deterministic GC for long-lived nginx workers.
     #    -d:isServer: enables SSR mode in isonim (buildHtmlString path).
@@ -59,6 +60,7 @@ stdenv.mkDerivation {
       --path:"${faststreamsPath}" \
       --path:"${stewPath}" \
       --path:"${isOnimPath}" \
+      --path:"${nimEverywherePath}" \
       --passC:"-fPIC" \
       $NGX_NIM_PASSC \
       src/handler.nim
