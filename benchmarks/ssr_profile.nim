@@ -61,20 +61,20 @@ results.add bench("1. resetHydrationCounter", N, proc() =
 printResult(results[^1])
 
 results.add bench("2. createRoot + dispose (empty)", N, proc() =
-  createRoot proc(dispose: proc()) = dispose())
+  createRoot do (dispose: proc()): dispose())
 printResult(results[^1])
 
 results.add bench("3. createRoot + 1 signal + dispose", N, proc() =
-  createRoot proc(dispose: proc()) =
+  createRoot do (dispose: proc()):
     let s = createSignal(0)
     discard s.val
     dispose())
 printResult(results[^1])
 
 results.add bench("4. createRoot + signal + memo + dispose", N, proc() =
-  createRoot proc(dispose: proc()) =
+  createRoot do (dispose: proc()):
     let ts = createSignal(@taskData)
-    let ac = createMemo proc(): int =
+    let ac = createMemo do () -> int:
       var c = 0
       for t in ts.val:
         if not t.done: inc c
@@ -106,9 +106,9 @@ results.add bench("6. uiString (5 items, forIn)", N, proc() =
 printResult(results[^1])
 
 results.add bench("7. renderToString (full task app)", N, proc() =
-  discard renderToString proc(): string =
+  discard renderToString do () -> string:
     let ts = createSignal(@taskData)
-    let ac = createMemo proc(): int =
+    let ac = createMemo do () -> int:
       var c = 0
       for t in ts.val:
         if not t.done: inc c
@@ -139,7 +139,7 @@ printResult(results[^1])
 results.add bench("9. FULL: render + hydration + alloc/copy", N, proc() =
   let rendered = renderToString(proc(): string =
     let ts = createSignal(@taskData)
-    let ac = createMemo proc(): int =
+    let ac = createMemo do () -> int:
       var c = 0
       for t in ts.val:
         if not t.done: inc c
@@ -170,7 +170,7 @@ printResult(results[^1])
 # Output size info
 let sample = renderToString(proc(): string =
   let ts = createSignal(@taskData)
-  let ac = createMemo proc(): int =
+  let ac = createMemo do () -> int:
     var c = 0
     for t in ts.val:
       if not t.done: inc c
