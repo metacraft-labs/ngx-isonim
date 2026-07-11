@@ -9,7 +9,9 @@ on:
 jobs:
   module-benchmarks:
     name: nginx Module Metrics
-    runs-on: ubuntu-latest
+    # Single Linux Nix class: metric collection auto-pushes to the
+    # gh-pages baseline, which must not race across parallel legs.
+    runs-on: incus
     steps:
       - uses: actions/checkout@v4
 
@@ -42,7 +44,9 @@ jobs:
 
   response-benchmarks:
     name: Response Size Metrics
-    runs-on: ubuntu-latest
+    # Single Linux Nix class: metric collection auto-pushes to the
+    # gh-pages baseline, which must not race across parallel legs.
+    runs-on: incus
     steps:
       - uses: actions/checkout@v4
 
