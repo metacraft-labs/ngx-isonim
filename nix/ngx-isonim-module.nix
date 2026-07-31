@@ -12,6 +12,23 @@
   nimEverywherePath,
 }:
 
+let
+  # An nginx dynamic module is loaded BY the nginx executable and resolves
+  # ngx_pcalloc / ngx_create_temp_buf / ngx_http_output_filter (and friends)
+  # against it at load time -- they are deliberately absent from the module's
+  # own link line.
+  #
+  # On ELF that is the default: a shared object may keep undefined symbols for
+  # the loader to resolve.  Mach-O is the opposite -- every symbol must resolve
+  # at link time unless the linker is told otherwise -- so on Darwin BOTH link
+  # steps below (Nim's own `--app:lib` link, and the final `cc -shared`) fail
+  # with "Undefined symbols for architecture arm64" naming exactly those nginx
+  # entry points.  `-undefined dynamic_lookup` restores the ELF behaviour.
+  #
+  # Empty on Linux, so the Linux derivation is unchanged.
+  undefinedDynamicLookup =
+    if stdenv.isDarwin then "-Wl,-undefined,dynamic_lookup" else "";
+in
 stdenv.mkDerivation {
   pname = "ngx-isonim-module";
   version = "0.1.0";
@@ -35,6 +52,17 @@ stdenv.mkDerivation {
     for dir in $(find ${nginxDevHeaders}/include/nginx -type f -name '*.h' -printf '%h\n' | sort -u); do
       NGX_INCLUDES="$NGX_INCLUDES -I$dir"
     done
+
+    # See `undefinedDynamicLookup` above.  Both are EMPTY on Linux, and an
+    # unquoted empty expansion contributes no argument at all, so the Linux
+    # command lines are byte-identical to before.
+    NGX_UNDEF_LD="${undefinedDynamicLookup}"
+    NGX_UNDEF_PASSL=${
+      if undefinedDynamicLookup == "" then
+        "\"\""
+      else
+        "--passL:${undefinedDynamicLookup}"
+    }
 
     # Build Nim --passC flags from the include dirs
     NGX_NIM_PASSC=""
@@ -62,6 +90,7 @@ stdenv.mkDerivation {
       --path:"${isOnimPath}" \
       --path:"${nimEverywherePath}" \
       --passC:"-fPIC" \
+      $NGX_UNDEF_PASSL \
       $NGX_NIM_PASSC \
       src/handler.nim
 
@@ -72,7 +101,7 @@ stdenv.mkDerivation {
       src/ngx_http_isonim_module.c
 
     # 3. Link into shared library with LTO
-    cc -shared -O2 -o ngx_http_isonim_module.so \
+    cc -shared -O2 $NGX_UNDEF_LD -o ngx_http_isonim_module.so \
       ngx_http_isonim_module.o \
       nimcache/*.o \
       -lpcre2-8 -lssl -lcrypto -lz
