@@ -2,9 +2,9 @@ name: Benchmarks
 
 on:
   push:
-    branches: [main]
+    branches: [main, dev, stable]
   pull_request:
-    branches: [main]
+    branches: [main, dev, stable]
 
 jobs:
   module-benchmarks:
@@ -28,7 +28,7 @@ jobs:
         run: cat benchmark-results.json
 
       - name: Store benchmark results
-        if: github.ref == 'refs/heads/main'
+        if: github.ref == 'refs/heads/dev'
         uses: benchmark-action/github-action-benchmark@v1
         with:
           name: "ngx-isonim Module Metrics"
@@ -78,7 +78,7 @@ jobs:
           cat response-results.json
 
       - name: Store response size results
-        if: github.ref == 'refs/heads/main'
+        if: github.ref == 'refs/heads/dev'
         uses: benchmark-action/github-action-benchmark@v1
         with:
           name: "ngx-isonim Response Sizes"
