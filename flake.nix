@@ -4,6 +4,10 @@
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixpkgs-unstable";
     flake-utils.url = "github:numtide/flake-utils";
+    git-hooks = {
+      url = "github:cachix/git-hooks.nix";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
 
     # Nim libraries — pinned to GitHub, overridable locally via .env:
     #   NIX_FLAKE_OVERRIDE_INPUTS='nim-faststreams=path:../nim-faststreams nim-stew=path:../nim-stew isonim=path:../isonim nim-everywhere=path:../nim-everywhere'
@@ -34,6 +38,7 @@
       nim-stew,
       isonim,
       nim-everywhere,
+      git-hooks,
     }:
     flake-utils.lib.eachDefaultSystem (
       system:
@@ -111,6 +116,16 @@
             mkdir -p /tmp/ngx-baseline-test
             exec ${nginxCompat}/bin/nginx -c ${baselineConf} -p /tmp/ngx-baseline-test "$@"
           '';
+        # The repo's pre-commit hooks. Entering the default dev shell writes
+        # the (gitignored) .pre-commit-config.yaml symlink and installs them;
+        # CI's shared lint workflow runs the same set from this shell.
+        preCommit = git-hooks.lib.${system}.run {
+          src = ./.;
+          hooks = {
+            check-added-large-files.enable = true;
+            check-merge-conflicts.enable = true;
+          };
+        };
       in
       {
         devShells.default = pkgs.mkShell {
@@ -138,6 +153,7 @@
           ];
 
           shellHook = ''
+            ${preCommit.shellHook}
             echo "ngx-isonim dev shell"
             echo "  nim $(nim --version 2>&1 | head -1)"
             echo "  nginx $(nginx -v 2>&1)"
