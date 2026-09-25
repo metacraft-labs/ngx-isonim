@@ -58,11 +58,9 @@
     "isonim": {
       "flake": false,
       "locked": {
-        "lastModified": 1778275675,
-        "narHash": "sha256-WVY68mTzY2ZRvMnxGjKNe62YJdUOmTzV/tlX+UzsZMY=",
         "owner": "metacraft-labs",
         "repo": "isonim",
-        "rev": "d323638f8d62719aeca1ea260b7de941e8881356",
+        "rev": "7268743981766f0d9c6d70d8d2ddbf70b8bd2c82",
         "type": "github"
       },
       "original": {
@@ -74,11 +72,9 @@
     "nim-everywhere": {
       "flake": false,
       "locked": {
-        "lastModified": 1777905429,
-        "narHash": "sha256-kshcHx+EUi+X2rsTwD/qYkKerkKo3MKJWaICJ+ZKYB8=",
         "owner": "metacraft-labs",
         "repo": "nim-everywhere",
-        "rev": "56c2e086f75b07bd42be4351571d02359347ba4f",
+        "rev": "fa3a64c71f99fdf995cb5015f2e75bae7635e17e",
         "type": "github"
       },
       "original": {

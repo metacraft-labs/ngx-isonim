@@ -4,6 +4,7 @@ nimcache/
 *.a
 build/
 .direnv/
+.repro/
 result
 result-*
 .env
