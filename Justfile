@@ -38,6 +38,7 @@ test:
     nim c -r -d:isNginxTest tests/test_handler.nim
     nim c -r -d:isNginxTest tests/test_config.nim
     nim c -r -d:isNginxTest tests/test_streaming_handler.nim
+    nim c -r tests/test_nimcache_is_worktree_local.nim
 
 # Run E2E integration tests (mock mode)
 test-e2e-integration:
