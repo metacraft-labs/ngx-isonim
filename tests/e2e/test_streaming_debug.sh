@@ -128,6 +128,10 @@ fi
 MASTER="$(cat "${WORK}/nginx.pid")"
 WORKER="$(pgrep -P "${MASTER}" | head -1)"
 fd_count() { find "/proc/${WORKER}/fd" -mindepth 1 -maxdepth 1 | wc -l; }
+# The module initializes on the worker's first request, and that opens one
+# descriptor for the worker's lifetime (Nim's event loop, async_loop.nim);
+# the baseline is taken after one request so it includes it.
+curl -sS --max-time 5 -o /dev/null "http://127.0.0.1:${PORT}/page?defer_ms=0"
 BASELINE="$(fd_count)"
 echo "  nginx on port ${PORT}, worker ${WORKER}, ${BASELINE} open fds"
 URL="http://127.0.0.1:${PORT}/page"

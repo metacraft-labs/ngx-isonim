@@ -125,7 +125,7 @@ suite "test_csp_nonce_differs_per_response":
       check resp.body.count("<script nonce=\"" & nonce & "\">") == scripts
 
   test "falsifying mutation: a fixed nonce fails the distinctness assertion":
-    let mutant = buildMutant("fixed-nonce", "src/response.nim",
+    let mutant = buildMutant("fixed-nonce", "isonim/src/isonim/server/response.nim",
       "    r.nonce = generateCspNonce()",
       "    r.nonce = \"Zml4ZWQtcGVyLWxvY2F0aW9u\"  # as if from the location conf")
     let m = startNginx(mutant, locations)

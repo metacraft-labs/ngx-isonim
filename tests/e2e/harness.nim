@@ -8,6 +8,9 @@
 ## * `buildMutant()` builds the module from a copy of the sources with one
 ##   exact text replacement: the tests use it to show that an assertion
 ##   fails when the behaviour it guards is broken (falsifying mutations).
+##   A file under `isonim/` (e.g. `isonim/src/isonim/server/response.nim`)
+##   is mutated in a copy of the isonim sibling's `src/`, which the mutant
+##   is then built against.
 ## * `startNginx()` starts nginx on a free port in a private prefix with the
 ##   given `location` blocks, and waits until it accepts connections.
 ## * `curl()` runs curl and returns its exit code, output and stderr.
@@ -54,9 +57,10 @@ proc testModule*(mode = "release"): string =
   result = repoRoot / "build/e2e" / mode / "ngx_http_isonim_module.so"
   buildModuleAt(repoRoot, mode, result, @["-d:ngxIsonimTestApps"])
 
-proc siblingPaths(): string =
+proc siblingPaths(isonimSrc = ""): string =
   let ws = repoRoot.parentDir
-  [ws / "nim-faststreams", ws / "nim-stew", ws / "isonim/src",
+  [ws / "nim-faststreams", ws / "nim-stew",
+   (if isonimSrc.len > 0: isonimSrc else: ws / "isonim/src"),
    ws / "nim-everywhere/src"].join(":")
 
 proc buildMutant*(name, file, original, replacement: string): string =
@@ -71,14 +75,20 @@ proc buildMutant*(name, file, original, replacement: string): string =
   createDir(root / "tests/e2e")
   copyDir(repoRoot / "tests/e2e/apps", root / "tests/e2e/apps")
   copyFile(repoRoot / "nim.cfg", root / "nim.cfg")
-  let path = root / file
+  var isonimSrc = ""
+  var path = root / file
+  if file.startsWith("isonim/"):
+    # The file is IsoNim's: mutate a copy of the sibling's src/.
+    copyDir(repoRoot.parentDir / "isonim/src", root / "isonim/src")
+    isonimSrc = root / "isonim/src"
+    path = root / file
   let text = readFile(path)
   let n = text.count(original)
   if n != 1:
     raise newException(ValueError, "mutation '" & name & "': expected one " &
       "occurrence of the original text in " & file & ", found " & $n)
   writeFile(path, text.replace(original, replacement))
-  putEnv("NGX_ISONIM_PATHS", siblingPaths())
+  putEnv("NGX_ISONIM_PATHS", siblingPaths(isonimSrc))
   try:
     result = root / "ngx_http_isonim_module.so"
     buildModuleAt(root, "release", result, @["-d:ngxIsonimTestApps"])

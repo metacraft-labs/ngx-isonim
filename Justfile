@@ -28,20 +28,25 @@ build-baseline:
 
 # --- Tests ---
 
+# The request, response, request context and server-function modules are
+# IsoNim's (isonim/server); the mock-mode tests compile against the sibling.
+isonim_path := "--path:../isonim/src"
+
 # Run unit tests (mock mode, no real nginx needed)
 test:
-    nim c -r -d:isNginxTest tests/test_adapter.nim
-    nim c -r -d:isNginxTest tests/test_handler.nim
-    nim c -r -d:isNginxTest tests/test_config.nim
-    nim c -r -d:isNginxTest tests/test_streaming_handler.nim
-    nim c -r -d:isNginxTest tests/test_request.nim
-    nim c -r -d:isNginxTest tests/test_response.nim
-    nim c -r -d:isNginxTest tests/test_nginx_headers.nim
+    nim c -r -d:isNginxTest {{isonim_path}} tests/test_adapter.nim
+    nim c -r -d:isNginxTest {{isonim_path}} tests/test_handler.nim
+    nim c -r -d:isNginxTest {{isonim_path}} tests/test_config.nim
+    nim c -r -d:isNginxTest {{isonim_path}} tests/test_streaming_handler.nim
+    nim c -r -d:isNginxTest {{isonim_path}} tests/test_request.nim
+    nim c -r -d:isNginxTest {{isonim_path}} tests/test_response.nim
+    nim c -r -d:isNginxTest {{isonim_path}} tests/test_nginx_headers.nim
+    nim c -r -d:isNginxTest {{isonim_path}} tests/test_rpc.nim
     nim c -r tests/test_nimcache_is_worktree_local.nim
 
 # Run E2E integration tests (mock mode)
 test-e2e-integration:
-    nim c -r -d:isNginxTest tests/test_e2e_integration.nim
+    nim c -r -d:isNginxTest {{isonim_path}} tests/test_e2e_integration.nim
 
 # Run IsoNim SSR tests (requires ../isonim)
 test-isonim:
@@ -55,10 +60,24 @@ test-e2e: build-e2e
     set -euo pipefail
     export NGX_ISONIM_E2E_MODULE="$PWD/build/e2e/release/ngx_http_isonim_module.so"
     bash tests/e2e/test_e2e.sh
-    for t in test_request_context test_csp_nonce test_max_buffer_size; do
+    for t in test_request_context test_csp_nonce test_max_buffer_size test_rpc; do
       nim c -r --hints:off -o:build/e2e/$t tests/e2e/$t.nim
     done
     bash tests/e2e/test_streaming_debug.sh
+    bash tests/e2e/test_rpc_asan.sh
+
+# The isonim_rpc end-to-end tests against a module built with
+# AddressSanitizer (part of test-e2e)
+test-e2e-asan:
+    bash tests/e2e/test_rpc_asan.sh
+
+# CI: `just test-e2e`, its full output also in test-logs/test-e2e.log
+# (.github/workflows/e2e.yml uploads that directory).
+ci-test-e2e:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    mkdir -p test-logs
+    just test-e2e 2>&1 | tee test-logs/test-e2e.log
 
 # Run all tests
 test-all: test test-e2e-integration test-isonim test-e2e

@@ -20,12 +20,16 @@ import std/strutils
 
 type
   DirectiveKind* = enum
-    ## The five nginx directives that control the IsoNim module.
+    ## The nginx directives that control the IsoNim module.
     dkSsr             ## isonim_ssr on|off
     dkSsrApp          ## isonim_ssr_app <name>
     dkSsrHydration    ## isonim_ssr_hydration on|off
     dkSsrMode         ## isonim_ssr_mode streaming|buffered
     dkSsrMaxBufSize   ## isonim_ssr_max_buffer_size <size>
+    dkRpc             ## isonim_rpc on|off
+    dkRpcApp          ## isonim_rpc_app <name>
+    dkRpcMaxBodySize  ## isonim_rpc_max_body_size <size>
+    dkRpcTimeout      ## isonim_rpc_timeout <time>
 
   TransportMode* = enum
     ## How the response body travels (`isonim_ssr_mode`).
@@ -57,9 +61,25 @@ type
     ## Streaming (default) or buffered transport.
     mode*: TransportMode
     modeSet*: bool
+    ## isonim_rpc: request bodies read, an async handler answers.
+    rpcEnabled*: bool
+    rpcEnabledSet*: bool
+    ## The async app (`isonim_rpc_app`); "" = the server-function registry.
+    rpcApp*: string
+    rpcAppSet*: bool
+    ## Largest request body in bytes (0 = unlimited); default 1m.
+    rpcMaxBodySize*: int
+    rpcMaxBodySizeSet*: bool
+    ## Handler timeout in milliseconds (0 = none); default 60s.
+    rpcTimeoutMs*: int
+    rpcTimeoutSet*: bool
 
   ConfigError* = object of CatchableError
     ## Raised when a directive value cannot be parsed.
+
+const
+  defaultRpcMaxBodySize* = 1024 * 1024   ## isonim_rpc_max_body_size: 1m
+  defaultRpcTimeoutMs* = 60_000          ## isonim_rpc_timeout: 60s
 
 proc defaultLocConf*(): IsoNimLocConf =
   ## Returns the default per-location configuration.
@@ -78,6 +98,8 @@ proc defaultLocConf*(): IsoNimLocConf =
     hydrationSet: false,
     mode: tmStreaming,
     modeSet: false,
+    rpcMaxBodySize: defaultRpcMaxBodySize,
+    rpcTimeoutMs: defaultRpcTimeoutMs,
   )
 
 proc parseLocConf*(enabled: bool; appName: string = "";
@@ -96,7 +118,22 @@ proc parseLocConf*(enabled: bool; appName: string = "";
     hydrationSet: true,
     mode: mode,
     modeSet: true,
+    rpcMaxBodySize: defaultRpcMaxBodySize,
+    rpcTimeoutMs: defaultRpcTimeoutMs,
   )
+
+proc parseRpcLocConf*(appName = ""; maxBodySize = defaultRpcMaxBodySize;
+                      timeoutMs = defaultRpcTimeoutMs): IsoNimLocConf =
+  ## An `isonim_rpc on` location, every rpc field explicitly configured.
+  result = defaultLocConf()
+  result.rpcEnabled = true
+  result.rpcEnabledSet = true
+  result.rpcApp = appName
+  result.rpcAppSet = appName.len > 0
+  result.rpcMaxBodySize = maxBodySize
+  result.rpcMaxBodySizeSet = true
+  result.rpcTimeoutMs = timeoutMs
+  result.rpcTimeoutSet = true
 
 # ----------------------------------------------------------------
 # Individual directive parsers
@@ -142,6 +179,40 @@ proc parseSizeDirective*(value: string): int =
     raise newException(ConfigError, "size too large: " & value)
   n * multiplier
 
+proc parseTimeDirective*(value: string): int =
+  ## Parse a time value as `ngx_conf_set_msec_slot` accepts it, in
+  ## milliseconds: a sequence of numbers with units `ms`, `s`, `m`, `h`,
+  ## `d`, `w`, `M`, `y` (no unit = seconds), e.g. `500ms`, `30s`, `1m30s`.
+  ## Raises ConfigError for anything else.
+  if value.len == 0:
+    raise newException(ConfigError, "empty time value")
+  var i = 0
+  var total = 0
+  while i < value.len:
+    var j = i
+    while j < value.len and value[j] in {'0'..'9'}: inc j
+    if j == i:
+      raise newException(ConfigError, "invalid time value: \"" & value & "\"")
+    let n = parseInt(value[i ..< j])
+    var k = j
+    while k < value.len and value[k] notin {'0'..'9', ' '}: inc k
+    let multiplier =
+      case value[j ..< k]
+      of "ms": 1
+      of "", "s": 1000
+      of "m": 60_000
+      of "h": 3_600_000
+      of "d": 86_400_000
+      of "w": 7 * 86_400_000
+      of "M": 30 * 86_400_000
+      of "y": 365 * 86_400_000
+      else:
+        raise newException(ConfigError, "invalid time unit in \"" & value & "\"")
+    total += n * multiplier
+    i = k
+    while i < value.len and value[i] == ' ': inc i
+  total
+
 proc parseModeDirective*(value: string): TransportMode =
   ## Parse `isonim_ssr_mode` ("streaming" or "buffered").
   case value
@@ -162,8 +233,14 @@ proc parseDirective*(kind: DirectiveKind; value: string): DirectiveValue =
     discard parseStringDirective(value)
   of dkSsrMode:
     discard parseModeDirective(value)
-  of dkSsrMaxBufSize:
+  of dkSsrMaxBufSize, dkRpcMaxBodySize:
     discard parseSizeDirective(value)
+  of dkRpc:
+    discard parseFlagDirective(value)
+  of dkRpcApp:
+    discard parseStringDirective(value)
+  of dkRpcTimeout:
+    discard parseTimeDirective(value)
   DirectiveValue(kind: kind, value: value)
 
 proc applyDirective*(conf: var IsoNimLocConf; dv: DirectiveValue) =
@@ -184,6 +261,18 @@ proc applyDirective*(conf: var IsoNimLocConf; dv: DirectiveValue) =
   of dkSsrMaxBufSize:
     conf.maxBufferSize = parseSizeDirective(dv.value)
     conf.maxBufferSizeSet = true
+  of dkRpc:
+    conf.rpcEnabled = parseFlagDirective(dv.value)
+    conf.rpcEnabledSet = true
+  of dkRpcApp:
+    conf.rpcApp = dv.value
+    conf.rpcAppSet = true
+  of dkRpcMaxBodySize:
+    conf.rpcMaxBodySize = parseSizeDirective(dv.value)
+    conf.rpcMaxBodySizeSet = true
+  of dkRpcTimeout:
+    conf.rpcTimeoutMs = parseTimeDirective(dv.value)
+    conf.rpcTimeoutSet = true
 
 # ----------------------------------------------------------------
 # Merge (same semantics as the C merge_loc_conf)
@@ -214,9 +303,25 @@ proc mergeLocConf*(parent, child: IsoNimLocConf): IsoNimLocConf =
     if parent.modeSet:
       result.mode = parent.mode
       result.modeSet = true
+  if not child.rpcEnabledSet and parent.rpcEnabledSet:
+    result.rpcEnabled = parent.rpcEnabled
+    result.rpcEnabledSet = true
+  if not child.rpcAppSet and parent.rpcAppSet:
+    result.rpcApp = parent.rpcApp
+    result.rpcAppSet = true
+  if not child.rpcMaxBodySizeSet and parent.rpcMaxBodySizeSet:
+    result.rpcMaxBodySize = parent.rpcMaxBodySize
+    result.rpcMaxBodySizeSet = true
+  if not child.rpcTimeoutSet and parent.rpcTimeoutSet:
+    result.rpcTimeoutMs = parent.rpcTimeoutMs
+    result.rpcTimeoutSet = true
 
 proc isValid*(conf: IsoNimLocConf): bool =
   ## Validates the configuration.
+  if conf.enabled and conf.rpcEnabled:
+    return false  # isonim_ssr and isonim_rpc cannot share a location
+  if conf.rpcEnabled and (conf.rpcMaxBodySize < 0 or conf.rpcTimeoutMs < 0):
+    return false
   if not conf.enabled:
     return true  # Disabled config is always valid
   if conf.appName.len == 0:

@@ -14,12 +14,15 @@
 ##   (test_max_buffer_size.nim).
 ## * `async_dashboard`, `boom`: the legacy streaming fixture and a renderer
 ##   that raises (test_e2e.sh).
+## * the server functions and the async app `rpc_echo` of rpc_app.nim
+##   (test_rpc.nim).
 
 import std/[json, base64, strutils, monotimes, times]
 import ../../../src/app_registry
 import ../../../src/ssr_router
 import isonim/ssr/streaming
 import async_app
+import rpc_app
 
 proc echoJson(req: SsrRequest): string =
   ## The request as the renderer saw it.
@@ -84,6 +87,8 @@ proc spin(ms: int) =
     discard
 
 proc registerE2eApps*() =
+  registerRpcApps()
+
   registerApp("echo", proc(req: SsrRequest; resp: SsrResponse): string =
     shape(req, resp)
     echoPage(req))

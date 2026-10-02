@@ -28,5 +28,16 @@
 #
 # Cross-repo siblings cloned by setup-dev-env at the explicit SHAs
 # pinned below (see codetracer-specs/Testing/Cross-Repo-CI-Integration.md).
-isonim=f39688e6d988d3622ad8575dd87792eeb022bf75  # isonim@dev tip
+#
+# Since IFP-M2 (isonim_rpc) the module and its mock tests import IsoNim's
+# request, response, request-context and server-function modules
+# (isonim/src/isonim/server/{request,response,context,rpc}.nim). The pin is
+# isonim@agents 78567d8, the commit that carries IFP-M2.
+isonim=78567d8b0ab4f0db74c18ea1e93954cdb7b53eac  # isonim@agents (IFP-M2)
 nim-everywhere=749f037dd40da1d0c04f499f568dda18f7aebd1b  # nim-everywhere@dev tip
+# scripts/build-module.sh compiles the module against ../nim-faststreams and
+# ../nim-stew (its DEFAULT_PATHS), so `just build` and `just test-e2e`
+# (.github/workflows/e2e.yml) need them on disk. The same revisions isonim's
+# own .github/sibling-repos pins (see its notes on both).
+nim-faststreams=82c8c3edb5fa7a4fdfcdb5d8ab53bbe1830d4503
+nim-stew=83eb1157963b7f49351dbdd858355fa990bbe23c

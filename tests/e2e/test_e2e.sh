@@ -282,6 +282,15 @@ check_rejected "an unknown isonim_ssr_mode" \
 check_rejected "a negative isonim_ssr_max_buffer_size" \
   'location /x { isonim_ssr on; isonim_ssr_app hello; isonim_ssr_max_buffer_size -1; }' \
   'invalid value'
+check_rejected "isonim_ssr and isonim_rpc in one location" \
+  'location /x { isonim_ssr on; isonim_ssr_app hello; isonim_rpc on; }' \
+  '"isonim_ssr on" and "isonim_rpc on" cannot share a location'
+check_rejected "an invalid isonim_rpc_timeout" \
+  'location /x { isonim_rpc on; isonim_rpc_timeout soon; }' \
+  'invalid value'
+check_rejected "an invalid isonim_rpc_max_body_size" \
+  'location /x { isonim_rpc on; isonim_rpc_max_body_size big; }' \
+  'invalid value'
 
 echo ""
 

@@ -17,11 +17,18 @@
 ## `proc(onChunk, onComplete)`) are still accepted by `registerApp` and
 ## `registerStreamingApp`, adapted to the new ones; such renderers simply
 ## ignore the request and leave the response at its defaults.
+##
+## An *async app* (`registerAsyncApp`) is an IsoNim `RequestHandler`: it
+## receives a `RequestContext` (request with body, response, session, CSRF
+## verdict) and completes a future, leaving the response in the context.
+## It is served at an `isonim_rpc` location named by `isonim_rpc_app`
+## (rpc.nim); a route manifest's `manifestApp` is one.
 
 import std/tables
 import request, response, response_body
+import isonim/server/context
 
-export request, response, response_body
+export request, response, response_body, context
 
 type
   SsrRenderer* = proc(req: SsrRequest; resp: SsrResponse): string
@@ -40,6 +47,7 @@ type
   AppKind* = enum
     akString     ## an SsrRenderer
     akStreaming  ## an SsrStreamingRenderer
+    akAsync      ## a RequestHandler, for isonim_rpc locations
 
   AppEntry* = ref object
     ## A registered app.
@@ -48,6 +56,8 @@ type
       render*: SsrRenderer
     of akStreaming:
       renderStream*: SsrStreamingRenderer
+    of akAsync:
+      handle*: RequestHandler
 
 var appRegistry: Table[string, AppEntry]
 
@@ -90,6 +100,13 @@ proc registerStreamingApp*(name: string; renderer: SsrStreamingRenderer) =
 
 proc registerStreamingApp*(name: string; renderer: StreamingAppRenderer) =
   registerStreamingApp(name, adapt(renderer))
+
+proc registerAsyncApp*(name: string; handler: RequestHandler) =
+  ## Registers an async app under `name`, replacing any app there.  Serve
+  ## it with `isonim_rpc on; isonim_rpc_app <name>;`.
+  if handler.isNil:
+    raise newException(ValueError, "nil handler for app '" & name & "'")
+  appRegistry[name] = AppEntry(kind: akAsync, handle: handler)
 
 proc lookupApp*(name: string): AppEntry =
   ## The app registered under `name`, or nil.

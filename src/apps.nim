@@ -6,6 +6,13 @@
 ## Built with `-d:ngxIsonimTestApps`, the module also registers the apps the
 ## end-to-end tests drive (tests/e2e/apps/e2e_apps.nim).
 ##
+## Built with `-d:ngxIsonimAppModule=<path to a .nim file>`, the module
+## compiles that application module in and calls its exported
+## `registerApps()` (after the built-in apps): this is how an application
+## (its renderers, async apps, route manifest, server functions and
+## `serverHooks`) gets into the module without editing it.  For example
+## `scripts/build-module.sh release out.so -d:ngxIsonimAppModule=$PWD/app.nim`.
+##
 ## Not compiled in mock mode (`-d:isNginxTest`): the unit tests register
 ## their own apps.
 
@@ -21,6 +28,18 @@ when not defined(isNginxTest):
 
   when defined(ngxIsonimTestApps):
     import ../tests/e2e/apps/e2e_apps
+
+  const ngxIsonimAppModule {.strdefine.} = ""
+    ## An application module compiled into the module (see above).
+
+  when ngxIsonimAppModule.len > 0:
+    import std/macros
+
+    macro importAppModule(): untyped =
+      nnkImportStmt.newTree(nnkInfix.newTree(ident"as",
+        newLit(ngxIsonimAppModule), ident"applicationModule"))
+
+    importAppModule()
 
   type
     Task = object
@@ -91,3 +110,6 @@ when not defined(isNginxTest):
 
     when defined(ngxIsonimTestApps):
       registerE2eApps()
+
+    when ngxIsonimAppModule.len > 0:
+      applicationModule.registerApps()

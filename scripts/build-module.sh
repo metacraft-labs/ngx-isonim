@@ -10,6 +10,11 @@
 # Usage:
 #   scripts/build-module.sh <release|debug> <output.so> [extra nim args...]
 #
+# An application is compiled in with -d:ngxIsonimAppModule=<absolute path of
+# a .nim file exporting registerApps()> (src/apps.nim); its directory's
+# siblings resolve as usual, and the module's own sources (app_registry,
+# ssr_router, ...) are importable by name.
+#
 # Environment:
 #   NGX_DEV_HEADERS   configured nginx headers (set by the dev shell and by
 #                     nix/nginx-dev-headers.nix). Required.
@@ -20,6 +25,9 @@
 #                     .nimcache/module-<mode> inside the checkout.
 #   NGX_ISONIM_EXTRA_LDFLAGS  extra flags for the final link (the Darwin
 #                     derivation passes -Wl,-undefined,dynamic_lookup).
+#   NGX_ISONIM_EXTRA_CFLAGS  extra flags for every C compile, the module's
+#                     and Nim's (`just test-e2e-asan` passes
+#                     -fsanitize=address).
 #
 # Modes:
 #   release  -d:release -d:danger --opt:speed, C at -O2 (what production runs)
@@ -66,7 +74,10 @@ while IFS= read -r dir; do
   NGX_NIM_PASSC+=("--passC:-I${dir}")
 done < <(find "${NGX_DEV_HEADERS}/include/nginx" -type f -name '*.h' -printf '%h\n' | sort -u)
 
-NIM_PATH_FLAGS=()
+# The module's own sources are on the path too, so that an application
+# module compiled in with -d:ngxIsonimAppModule=<file> can import them by
+# name (app_registry, ssr_router; see src/apps.nim).
+NIM_PATH_FLAGS=("--path:${ROOT}/src")
 for p in "${NIM_PATHS[@]}"; do
   NIM_PATH_FLAGS+=("--path:${p}")
 done
@@ -79,6 +90,15 @@ fi
 NIM_EXTRA_PASSL=()
 for f in "${EXTRA_LD[@]}"; do
   NIM_EXTRA_PASSL+=("--passL:${f}")
+done
+EXTRA_CC=()
+if [ -n "${NGX_ISONIM_EXTRA_CFLAGS:-}" ]; then
+  # shellcheck disable=SC2206 # deliberately split into separate flags
+  EXTRA_CC=(${NGX_ISONIM_EXTRA_CFLAGS})
+fi
+NIM_EXTRA_PASSC=()
+for f in "${EXTRA_CC[@]}"; do
+  NIM_EXTRA_PASSC+=("--passC:${f}")
 done
 
 rm -rf "${NIMCACHE}"
@@ -102,6 +122,7 @@ nim c \
   -d:useFaststreams \
   "${NIM_PATH_FLAGS[@]}" \
   --passC:-fPIC \
+  "${NIM_EXTRA_PASSC[@]}" \
   "${NIM_EXTRA_PASSL[@]}" \
   "${NGX_NIM_PASSC[@]}" \
   -o:"${WORK}/nim-side.so" \
@@ -109,7 +130,7 @@ nim c \
   "${ROOT}/src/handler.nim"
 
 # 2. The C module definition (directives, handlers, postconfiguration).
-cc -c -fPIC "${CC_MODE_FLAGS[@]}" -Wall -Werror=implicit-function-declaration \
+cc -c -fPIC "${CC_MODE_FLAGS[@]}" "${EXTRA_CC[@]}" -Wall -Werror=implicit-function-declaration \
   "${NGX_INCLUDES[@]}" \
   -o "${WORK}/ngx_http_isonim_module.o" \
   "${ROOT}/src/ngx_http_isonim_module.c"

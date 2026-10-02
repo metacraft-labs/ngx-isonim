@@ -283,3 +283,48 @@ suite "Config - Merge":
     let merged = mergeLocConf(parent, child)
     check merged.enabledSet == true  # inherited from parent
     check merged.appNameSet == true
+
+suite "Config - isonim_rpc":
+  test "rpc_defaults":
+    let c = defaultLocConf()
+    check c.rpcEnabled == false
+    check c.rpcApp == ""
+    check c.rpcMaxBodySize == 1024 * 1024
+    check c.rpcTimeoutMs == 60_000
+
+  test "parse_and_apply_rpc_directives":
+    var c = defaultLocConf()
+    c.applyDirective(parseDirective(dkRpc, "on"))
+    c.applyDirective(parseDirective(dkRpcApp, "forum"))
+    c.applyDirective(parseDirective(dkRpcMaxBodySize, "1100k"))
+    c.applyDirective(parseDirective(dkRpcTimeout, "30s"))
+    check c.rpcEnabled and c.rpcEnabledSet
+    check c.rpcApp == "forum"
+    check c.rpcMaxBodySize == 1100 * 1024
+    check c.rpcTimeoutMs == 30_000
+    check c.isValid
+
+  test "parse_time_values_as_nginx_does":
+    check parseTimeDirective("500ms") == 500
+    check parseTimeDirective("30") == 30_000
+    check parseTimeDirective("1m30s") == 90_000
+    check parseTimeDirective("2h") == 7_200_000
+    expect ConfigError: discard parseTimeDirective("soon")
+    expect ConfigError: discard parseTimeDirective("5x")
+    expect ConfigError: discard parseTimeDirective("")
+
+  test "ssr_and_rpc_cannot_share_a_location":
+    var c = parseRpcLocConf()
+    check c.isValid
+    c.enabled = true
+    c.appName = "app"
+    check not c.isValid
+
+  test "rpc_settings_inherit":
+    let parent = parseRpcLocConf(appName = "forum", maxBodySize = 2048,
+                                 timeoutMs = 5000)
+    let merged = mergeLocConf(parent, defaultLocConf())
+    check merged.rpcEnabled
+    check merged.rpcApp == "forum"
+    check merged.rpcMaxBodySize == 2048
+    check merged.rpcTimeoutMs == 5000

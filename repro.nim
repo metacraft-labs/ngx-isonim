@@ -80,8 +80,10 @@
 ##     — ``-d:isNginxTest``. Under this define ``src/nginx_types.nim`` swaps to
 ##     the MOCK nginx bindings (no real nginx headers) and ``src/apps.nim``
 ##     compiles to nothing (its real ``import isonim/...`` block is
-##     ``when not defined(isNginxTest)``), so these tests are a pure-Nim LEAF —
-##     they need neither the nginx dev headers nor the isonim sibling. Eight
+##     ``when not defined(isNginxTest)``), so these tests need no nginx dev
+##     headers.  They do compile against the isonim sibling: the request,
+##     response, request context and server-function modules are IsoNim's
+##     (``isonim/server``), threaded by the ``uses:`` edge below. Nine
 ##     files:
 ##       - ``test_adapter``            (``import ../src/nginx_adapter``)
 ##       - ``test_handler``            (``import ../src/handler`` + e2e/apps/hello)
@@ -91,6 +93,8 @@
 ##       - ``test_nginx_headers``      (``import ../src/nginx_http_adapter``)
 ##       - ``test_request``            (``import ../src/{request,handler}``)
 ##       - ``test_response``           (``import ../src/response``)
+##       - ``test_rpc``                (``import ../src/handler`` + isonim
+##         server functions: the isonim_rpc pipeline over asyncdispatch)
 ##     ``test_nginx_headers`` is not in a ``Justfile`` recipe but is a real
 ##     ``unittest`` suite that compiles + runs headless under ``-d:isNginxTest``
 ##     (it exercises the mock header-list adapter), so it gets a full edge.
@@ -156,8 +160,8 @@ proc spec(stem: string): NgxTestSpec =
   NgxTestSpec(source: "tests/" & stem & ".nim",
     binary: "build/test-bin/" & stem)
 
-# Mock/unit group — ``-d:isNginxTest``. Pure-Nim leaf (mock nginx bindings +
-# empty ``apps.nim``); no nginx headers, no isonim sibling.
+# Mock/unit group — ``-d:isNginxTest``. Mock nginx bindings + empty
+# ``apps.nim``; no nginx headers; isonim/server from the sibling.
 const mockTestSpecs: seq[NgxTestSpec] = @[
   spec("test_adapter"),
   spec("test_handler"),
@@ -167,6 +171,7 @@ const mockTestSpecs: seq[NgxTestSpec] = @[
   spec("test_nginx_headers"),
   spec("test_request"),
   spec("test_response"),
+  spec("test_rpc"),
 ]
 
 # IsoNim-SSR group — ``-d:isServer -d:asyncBackend=none`` + the SC-11 sibling

@@ -34,12 +34,15 @@ just test-e2e
 ```
 src/
   ngx_http_isonim_module.c  # Module registration, directives, C helpers
-  handler.nim             # Nim entry point (nim_handle_request)
-  serve.nim               # The request pipeline (shared with the unit tests)
-  request.nim             # SsrRequest: what a renderer receives
-  response.nim            # SsrResponse: status, headers, cookies, redirects, CSP nonce
+  handler.nim             # Nim entry points (nim_handle_request, nim_handle_rpc)
+  serve.nim               # The SSR pipeline (shared with the unit tests)
+  rpc.nim                 # The isonim_rpc pipeline (server functions, async apps)
+  async_loop.nim          # Nim's event loop (asyncdispatch) inside the worker's
+  request.nim             # SsrRequest (IsoNim's isonim/server/request)
+  response.nim            # SsrResponse (IsoNim's isonim/server/response)
   response_body.nim       # ResponseBody: the streaming writer
-  app_registry.nim        # App name -> renderer
+  app_registry.nim        # App name -> renderer or async app
+  apps.nim                # Apps compiled in (and -d:ngxIsonimAppModule=<file>)
   ssr_router.nim          # routedApp: per-request routing via IsoNim's SSR router
   config.nim              # Directive model
   nginx_types.nim         # nginx C API bindings (and their mocks)
@@ -64,7 +67,23 @@ location /app {
     isonim_ssr_mode streaming;        # default; or: buffered
     isonim_ssr_max_buffer_size 1m;    # 0 (default) = unlimited
 }
+
+# IsoNim server functions (POST <rpcPrefix>/<module>/<proc>), or with
+# isonim_rpc_app an async app such as a route manifest's dispatch.
+location /api/v1/rpc/ {
+    isonim_rpc on;
+    isonim_rpc_max_body_size 1m;      # default 1m; larger bodies get 413
+    isonim_rpc_timeout 60s;           # default 60s; then 504
+}
+location / {
+    isonim_rpc on;
+    isonim_rpc_app forum;             # registerAsyncApp("forum", manifestApp(...))
+}
 ```
+
+An application is compiled into the module with
+`scripts/build-module.sh release out.so -d:ngxIsonimAppModule=/abs/app.nim`;
+the module calls the app module's `registerApps()`.
 
 ## Writing an App
 

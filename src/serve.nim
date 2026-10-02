@@ -149,6 +149,11 @@ proc serve*(req: SsrRequest; app: AppEntry; opts: ServeOptions;
       "\" (isonim_ssr_app)")
     return NGX_HTTP_INTERNAL_SERVER_ERROR
 
+  if app.kind == akAsync:
+    sink.log(NGX_LOG_ERR, "app \"" & opts.appName & "\" is an async app; " &
+      "serve it at an isonim_rpc location (isonim_rpc_app)")
+    return NGX_HTTP_INTERNAL_SERVER_ERROR
+
   let st = ServeState(req: req, resp: newSsrResponse(), opts: opts,
                       sink: sink, lastRc: NGX_OK)
   let body = newResponseBody(
@@ -163,6 +168,8 @@ proc serve*(req: SsrRequest; app: AppEntry; opts: ServeOptions;
         st.write(html.toOpenArray(0, html.high))
     of akStreaming:
       app.renderStream(req, st.resp, body)
+    of akAsync:
+      discard   # refused above
     st.finish()
     return st.lastRc
   except CatchableError as e:

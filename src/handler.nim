@@ -9,16 +9,23 @@
 ## into an `SsrRequest`, looks the app up, and runs the shared pipeline
 ## (`serve.serve`) over a sink that calls back into the C helpers.
 ##
+## At an `isonim_rpc` location the C side reads the body first and calls
+## `nim_handle_rpc`, which starts the asynchronous pipeline of rpc.nim and
+## runs Nim's event loop (async_loop.nim); `nim_rpc_timeout` and
+## `nim_rpc_released` are that request's timeout and end.
+##
 ## Compiled with `-d:isNginxTest` the module instead provides
-## `serveRecorded` / `serveMockRequest`: the same pipeline over a recording
-## sink, so the unit tests exercise the code nginx runs.
+## `serveRecorded` / `serveMockRequest` / `serveRpcRecorded`: the same
+## pipelines over a recording sink, so the unit tests exercise the code
+## nginx runs.
 
 import nginx_types
 import config
 import app_registry
 import serve
+import rpc
 
-export config, app_registry, serve
+export config, app_registry, serve, rpc
 
 when defined(isNginxTest):
   type
@@ -47,14 +54,12 @@ when defined(isNginxTest):
         ## 1-based index of the sendBody call that fails as if the client
         ## had gone away (NGX_ERROR); 0 = never.
 
-  proc serveRecorded*(req: SsrRequest; app: AppEntry; opts: ServeOptions;
-                      recording = RecordingOptions()): RecordedResponse =
-    ## Runs the pipeline over a sink that records what it is given and
-    ## behaves as nginx does for HEAD, 204 and 304 (no body).
-    var rec: RecordedResponse
-    let recPtr = addr rec
+  proc recordingSink(req: SsrRequest; recPtr: ptr RecordedResponse;
+                     recording: RecordingOptions): ResponseSink =
+    ## A sink that records what it is given and behaves as nginx does for
+    ## HEAD, 204 and 304 (no body).
     var sendCount = 0
-    let sink = ResponseSink(
+    ResponseSink(
       sendHeader: proc(resp: SsrResponse; contentLength: int64): NgxInt =
         doAssert not recPtr.headersSent, "headers sent twice"
         recPtr.headersSent = true
@@ -80,8 +85,47 @@ when defined(isNginxTest):
       log: proc(level: NgxUint; msg: string) =
         recPtr.log.add((level, msg)),
     )
-    rec.rc = serve(req, app, opts, sink)
+
+  proc serveRecorded*(req: SsrRequest; app: AppEntry; opts: ServeOptions;
+                      recording = RecordingOptions()): RecordedResponse =
+    ## Runs the SSR pipeline over a recording sink.
+    var rec: RecordedResponse
+    rec.rc = serve(req, app, opts, recordingSink(req, addr rec, recording))
     rec
+
+  type
+    RpcRecording* = ref object
+      ## One isonim_rpc request in mock mode.
+      response*: RecordedResponse
+      finished*: bool          ## the request was finalized
+      finalRc*: NgxInt         ## what it was finalized with
+      state*: RpcState
+
+  proc startRpcRecorded*(req: SsrRequest; appName = "";
+                         timeoutMs = 0): RpcRecording =
+    ## Starts an isonim_rpc request over a recording sink.  `timeoutMs`
+    ## models isonim_rpc_timeout with an asyncdispatch timer (nginx uses its
+    ## own).  Drive the event loop (`poll`) until `finished`.
+    let r = RpcRecording()
+    let st = startRpc(req, appName,
+      recordingSink(req, addr r.response, RecordingOptions()),
+      proc(rc: NgxInt) =
+        doAssert not r.finished, "request finalized twice"
+        r.finished = true
+        r.finalRc = rc)
+    r.state = st
+    st.run()
+    if timeoutMs > 0:
+      sleepAsync(timeoutMs).addCallback(proc() {.gcsafe.} =
+        {.cast(gcsafe).}: st.timeout())
+    r
+
+  proc serveRpcRecorded*(req: SsrRequest; appName = "";
+                         timeoutMs = 0): RpcRecording =
+    ## Runs one isonim_rpc request to its end.
+    result = startRpcRecorded(req, appName, timeoutMs)
+    while not result.finished:
+      poll(10)
 
   proc toSsrRequest*(r: NgxHttpRequest): SsrRequest =
     ## The SsrRequest nim_handle_request would build from this request.
@@ -104,6 +148,7 @@ else:
   # before any Nim code; nim_module_init does that on the first request.
   import nginx_http_adapter
   import apps
+  import async_loop
 
   type
     RequestView {.bycopy.} = object
@@ -121,6 +166,7 @@ else:
     ## Called once per worker, from C, before the first request.
     NimMain()
     registerDefaultApps()
+    startAsyncLoop()
 
   proc logTo(r: NgxHttpRequest; level: NgxUint; msg: string) =
     if msg.len > 0:
@@ -153,7 +199,7 @@ else:
         logTo(r, level, msg),
     )
 
-  proc buildRequest(view: ptr RequestView): SsrRequest =
+  proc buildRequest(view: ptr RequestView; body = ""): SsrRequest =
     var headers: seq[(string, string)]
     for (k, v) in walkHeaders(view.headers):
       headers.add((ngxStrToString(k), ngxStrToString(v)))
@@ -163,7 +209,8 @@ else:
       rawUri = ngxStrToString(view.unparsedUri),
       query = ngxStrToString(view.args),
       headers = headers,
-      clientAddr = ngxStrToString(view.addrText))
+      clientAddr = ngxStrToString(view.addrText),
+      body = body)
 
   proc nimHandleRequest*(r: NgxHttpRequest; view: ptr RequestView;
                          viewSize: csize_t;
@@ -194,3 +241,59 @@ else:
     except Exception as e:
       logTo(r, NGX_LOG_ERR, "unhandled " & $e.name & ": " & e.msg)
       NGX_ERROR
+
+  # ------------------------------------------------------------------------
+  # isonim_rpc locations
+  # ------------------------------------------------------------------------
+
+  proc nimHandleRpc*(r: NgxHttpRequest; cctx: pointer; view: ptr RequestView;
+                     viewSize: csize_t; body: ptr char; bodyLen: csize_t;
+                     appName: ptr char; appNameLen: csize_t)
+      {.exportc: "nim_handle_rpc", cdecl.} =
+    ## Called by the C body handler once the request body is read.  Starts
+    ## the handler; the request is finalized (ngx_http_isonim_finalize)
+    ## when it completes, times out, or fails to start.
+    if viewSize != csize_t(sizeof(RequestView)):
+      logTo(r, NGX_LOG_ERR, "request view size mismatch between C (" &
+        $viewSize & ") and Nim (" & $sizeof(RequestView) & ")")
+      ngx_http_isonim_finalize(r, NGX_HTTP_INTERNAL_SERVER_ERROR)
+      return
+    try:
+      var name = newString(int(appNameLen))
+      if appNameLen > 0:
+        copyMem(addr name[0], appName, int(appNameLen))
+      var bodyText = newString(int(bodyLen))
+      if bodyLen > 0:
+        copyMem(addr bodyText[0], body, int(bodyLen))
+      let st = startRpc(buildRequest(view, bodyText), name, nginxSink(r),
+        proc(rc: NgxInt) = ngx_http_isonim_finalize(r, rc))
+      # Owned by the C side until the request pool is released
+      # (nim_rpc_released); bound before anything can finalize it.
+      GC_ref(st)
+      ngx_http_isonim_rpc_bind(cctx, cast[pointer](st))
+      st.run()
+    except Exception as e:
+      logTo(r, NGX_LOG_ERR, "unhandled " & $e.name & ": " & e.msg)
+      ngx_http_isonim_finalize(r, NGX_HTTP_INTERNAL_SERVER_ERROR)
+    pump()
+
+  proc nimRpcTimeout*(state: pointer) {.exportc: "nim_rpc_timeout", cdecl.} =
+    ## `timeout` answers 504 and finalizes the request, which can destroy
+    ## its pool: the pool cleanup (`nimRpcReleased`) then drops the C
+    ## side's reference to the state while `timeout` is still running on
+    ## it.  This reference keeps the state alive until `timeout` has
+    ## returned; nothing here touches the request after the finalize.
+    let st = cast[RpcState](state)
+    GC_ref(st)
+    try:
+      st.timeout()
+    except Exception as e:
+      discard e     # nothing may escape into nginx's C frames
+    finally:
+      GC_unref(st)
+
+  proc nimRpcReleased*(state: pointer) {.exportc: "nim_rpc_released", cdecl.} =
+    let st = cast[RpcState](state)
+    st.release()
+    GC_unref(st)
+

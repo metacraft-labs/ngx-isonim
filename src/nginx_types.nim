@@ -96,6 +96,23 @@ when not defined(isNginxTest):
       msg: ptr char; len: csize_t)
     {.importc: "ngx_http_isonim_log", cdecl.}
 
+  # isonim_rpc requests (rpc.nim) and the event-loop hookup
+  # (async_loop.nim).
+  proc ngx_http_isonim_finalize*(r: NgxHttpRequest; rc: NgxInt)
+    {.importc: "ngx_http_isonim_finalize", cdecl.}
+
+  proc ngx_http_isonim_rpc_bind*(ctx: pointer; state: pointer)
+    {.importc: "ngx_http_isonim_rpc_bind", cdecl.}
+
+  proc ngx_http_isonim_async_arm*(msec: NgxInt)
+    {.importc: "ngx_http_isonim_async_arm", cdecl.}
+
+  proc ngx_http_isonim_async_watch_fd*(fd: NgxInt): NgxInt
+    {.importc: "ngx_http_isonim_async_watch_fd", cdecl.}
+
+  proc ngx_http_isonim_log_cycle*(level: NgxUint; msg: ptr char; len: csize_t)
+    {.importc: "ngx_http_isonim_log_cycle", cdecl.}
+
 else:
   # Mock implementations for testing.
 
@@ -266,4 +283,6 @@ const
   NGX_HTTP_OK*: NgxInt = 200
   NGX_HTTP_NOT_FOUND*: NgxInt = 404
   NGX_HTTP_NOT_ALLOWED*: NgxInt = 405
+  NGX_HTTP_REQUEST_ENTITY_TOO_LARGE*: NgxInt = 413
   NGX_HTTP_INTERNAL_SERVER_ERROR*: NgxInt = 500
+  NGX_HTTP_GATEWAY_TIME_OUT*: NgxInt = 504
