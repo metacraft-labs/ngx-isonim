@@ -125,7 +125,7 @@ suite "Pipeline - buffered transport":
     let rec = serveRecorded(getReq(), page("<p>x</p>"),
                             opts(tmBuffered, hydration = true))
     check rec.body.startsWith("<p>x</p><script nonce=")
-    check rec.body.endsWith("</script>")
+    check rec.body.endsWith("</script><!--xs-->")   # IsoNim's bootstrap
     check rec.contentLength == rec.body.len
 
   test "streaming_renderer_on_buffered_transport_is_sent_whole":
@@ -359,11 +359,14 @@ suite "Pipeline - isonim_ssr_max_buffer_size":
 
   test "the_hydration_script_counts_against_the_limit":
     let body = repeat('z', 4000)
+    # The bootstrap with a 24-character nonce, exactly as served.
+    let script = hydrationScript(repeat('n', 24)).len
     let ok = serveRecorded(getReq(), page(body),
-      opts(tmBuffered, hydration = true, maxBufferSize = 4000 + 200))
+      opts(tmBuffered, hydration = true, maxBufferSize = 4000 + script))
     check ok.rc == NGX_OK
+    check ok.body.len == 4000 + script
     let tooBig = serveRecorded(getReq(), page(body),
-      opts(tmBuffered, hydration = true, maxBufferSize = 4000 + 20))
+      opts(tmBuffered, hydration = true, maxBufferSize = 4000 + script - 1))
     check tooBig.rc == NGX_HTTP_INTERNAL_SERVER_ERROR
 
   test "zero_means_unlimited":

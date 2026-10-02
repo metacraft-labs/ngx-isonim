@@ -31,9 +31,11 @@
 #
 # Since IFP-M2 (isonim_rpc) the module and its mock tests import IsoNim's
 # request, response, request-context and server-function modules
-# (isonim/src/isonim/server/{request,response,context,rpc}.nim). The pin is
-# isonim@agents 78567d8, the commit that carries IFP-M2.
-isonim=78567d8b0ab4f0db74c18ea1e93954cdb7b53eac  # isonim@agents (IFP-M2)
+# (isonim/src/isonim/server/{request,response,context,rpc}.nim), and since
+# IFP-M3 it serves IsoNim's hydration bootstrap (generateHydrationScript of
+# isonim/src/isonim/ssr/markers.nim). The pin is isonim@agents bd31893, the
+# commit that carries IFP-M3.
+isonim=bd318930aa26d5e2194da671011e09a269242c99  # isonim@agents (IFP-M3)
 nim-everywhere=749f037dd40da1d0c04f499f568dda18f7aebd1b  # nim-everywhere@dev tip
 # scripts/build-module.sh compiles the module against ../nim-faststreams and
 # ../nim-stew (its DEFAULT_PATHS), so `just build` and `just test-e2e`

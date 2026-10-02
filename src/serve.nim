@@ -31,6 +31,7 @@
 ## connection, or an HTTP status for nginx to answer with its own error page.
 
 import nginx_types, config, app_registry
+import isonim/ssr/markers
 
 type
   ServeOptions* = object
@@ -65,9 +66,9 @@ type
 
 proc hydrationScript*(nonce: string): string =
   ## The bootstrap script that records events until the client runtime
-  ## hydrates, carrying this response's CSP nonce.
-  "<script nonce=\"" & nonce & "\">window._$HY={events:[\"click\",\"input\"]," &
-    "completed:new WeakSet,registry:new Map};</script>"
+  ## hydrates (IsoNim's `generateHydrationScript`, the one its `hydrate`
+  ## reads and replays), carrying this response's CSP nonce.
+  generateHydrationScript(nonce = nonce)
 
 proc commit(st: ServeState; contentLength: int64) =
   ## Sends the status and headers.  Called once, before the first body byte.
