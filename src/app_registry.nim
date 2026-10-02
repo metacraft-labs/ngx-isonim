@@ -1,47 +1,100 @@
 ## app_registry.nim
 ##
-## Registry mapping app names to render functions.
-## The handler looks up the app by name from the location config
-## and calls the corresponding renderer to produce HTML.
+## Registry mapping app names (`isonim_ssr_app <name>`) to renderers.
+##
+## A renderer receives the request and the response it may shape:
+##
+## * `SsrRenderer` returns the whole body as a string;
+## * `SsrStreamingRenderer` writes the body through a `ResponseBody`,
+##   flushing as parts become ready (the shell first, then Suspense
+##   boundaries).
+##
+## Either kind works on either transport (`isonim_ssr_mode streaming` or
+## `buffered`): the transport decides how the bytes travel, the renderer
+## decides what they are.
+##
+## The renderer signatures of earlier versions (`proc(): string` and
+## `proc(onChunk, onComplete)`) are still accepted by `registerApp` and
+## `registerStreamingApp`, adapted to the new ones; such renderers simply
+## ignore the request and leave the response at its defaults.
 
 import std/tables
+import request, response, response_body
+
+export request, response, response_body
 
 type
+  SsrRenderer* = proc(req: SsrRequest; resp: SsrResponse): string
+    ## Renders the whole body.
+
+  SsrStreamingRenderer* = proc(req: SsrRequest; resp: SsrResponse;
+                               body: ResponseBody)
+    ## Writes the body through `body`; returning ends the response.
+
   AppRenderer* = proc(): string
-    ## Returns rendered HTML for the page.
+    ## Earlier signature, kept so existing apps compile unchanged.
 
   StreamingAppRenderer* = proc(onChunk: proc(chunk: string), onComplete: proc())
-    ## Streaming renderer that calls onChunk for each piece of output.
-    ## Calls onComplete when all content (including Suspense boundaries) is done.
-    ## The shell is the first chunk (TTFB).
-    ## Subsequent chunks are Suspense boundary replacements.
+    ## Earlier streaming signature: each `onChunk` is written and flushed.
 
-var appRegistry: Table[string, AppRenderer]
-var streamingAppRegistry: Table[string, StreamingAppRenderer]
+  AppKind* = enum
+    akString     ## an SsrRenderer
+    akStreaming  ## an SsrStreamingRenderer
 
-proc registerApp*(name: string, renderer: AppRenderer) =
-  ## Register an app renderer under the given name.
-  appRegistry[name] = renderer
+  AppEntry* = ref object
+    ## A registered app.
+    case kind*: AppKind
+    of akString:
+      render*: SsrRenderer
+    of akStreaming:
+      renderStream*: SsrStreamingRenderer
 
-proc getApp*(name: string): AppRenderer =
-  ## Look up a registered app by name.
-  ## Returns nil if no app is registered under that name.
-  if name in appRegistry:
-    return appRegistry[name]
-  return nil
+var appRegistry: Table[string, AppEntry]
 
-proc registerStreamingApp*(name: string, renderer: StreamingAppRenderer) =
-  ## Register a streaming app renderer under the given name.
-  streamingAppRegistry[name] = renderer
+proc stringApp*(renderer: SsrRenderer): AppEntry =
+  AppEntry(kind: akString, render: renderer)
 
-proc getStreamingApp*(name: string): StreamingAppRenderer =
-  ## Look up a registered streaming app by name.
-  ## Returns nil if no streaming app is registered under that name.
-  if name in streamingAppRegistry:
-    return streamingAppRegistry[name]
-  return nil
+proc streamingApp*(renderer: SsrStreamingRenderer): AppEntry =
+  AppEntry(kind: akStreaming, renderStream: renderer)
+
+proc adapt*(renderer: AppRenderer): SsrRenderer =
+  ## Wraps an argument-less renderer.
+  if renderer.isNil: return nil
+  result = proc(req: SsrRequest; resp: SsrResponse): string = renderer()
+
+proc adapt*(renderer: StreamingAppRenderer): SsrStreamingRenderer =
+  ## Wraps an onChunk/onComplete renderer: every chunk is written and
+  ## flushed, so each one reaches the client as soon as it is produced.
+  if renderer.isNil: return nil
+  result = proc(req: SsrRequest; resp: SsrResponse; body: ResponseBody) =
+    renderer(
+      proc(chunk: string) =
+        body.write(chunk)
+        body.flush(),
+      proc() = discard)
+
+proc registerApp*(name: string; renderer: SsrRenderer) =
+  ## Registers a string renderer under `name`, replacing any app there.
+  if renderer.isNil:
+    raise newException(ValueError, "nil renderer for app '" & name & "'")
+  appRegistry[name] = stringApp(renderer)
+
+proc registerApp*(name: string; renderer: AppRenderer) =
+  registerApp(name, adapt(renderer))
+
+proc registerStreamingApp*(name: string; renderer: SsrStreamingRenderer) =
+  ## Registers a streaming renderer under `name`, replacing any app there.
+  if renderer.isNil:
+    raise newException(ValueError, "nil renderer for app '" & name & "'")
+  appRegistry[name] = streamingApp(renderer)
+
+proc registerStreamingApp*(name: string; renderer: StreamingAppRenderer) =
+  registerStreamingApp(name, adapt(renderer))
+
+proc lookupApp*(name: string): AppEntry =
+  ## The app registered under `name`, or nil.
+  appRegistry.getOrDefault(name, nil)
 
 proc clearApps*() =
-  ## Remove all registered apps. Used by tests for cleanup.
+  ## Removes every registered app.  Used by tests.
   appRegistry.clear()
-  streamingAppRegistry.clear()

@@ -1,24 +1,23 @@
 #!/usr/bin/env bash
 #
-# E2E test runner for ngx-isonim.
-# Starts nginx with the isonim module, runs curl tests, stops nginx.
+# E2E smoke test for ngx-isonim: a real nginx with the module loaded,
+# checked with curl.
 #
-# Prerequisites:
-#   - nix build .#nginx-with-isonim  (produces the module .so)
-#   - nginx binary available in PATH
+# Uses the module named by NGX_ISONIM_E2E_MODULE, or builds one with the
+# end-to-end apps (scripts/build-module.sh release ... -d:ngxIsonimTestApps).
+# Needs nginx and curl on PATH (the dev shell provides both); wrk is
+# optional.
 #
-# Usage:
+# Usage (in the dev shell):
 #   bash tests/e2e/test_e2e.sh
 #
-# The script exits 0 if all tests pass, 1 otherwise.
+# Exits 0 if all tests pass, 1 otherwise.  No mocks.
 
-set -euo pipefail
+set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-TEST_DIR="/tmp/ngx-isonim-test"
-NGINX_CONF="${SCRIPT_DIR}/nginx.conf"
-PORT=8088
-BASE_URL="http://localhost:${PORT}"
+ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
+TEST_DIR="$(mktemp -d)"
 
 PASS=0
 FAIL=0
@@ -30,70 +29,67 @@ SKIP=0
 
 # shellcheck disable=SC2329
 cleanup() {
-    echo ""
-    echo "Cleaning up..."
-    if [ -f "${TEST_DIR}/nginx.pid" ]; then
-        kill "$(cat "${TEST_DIR}/nginx.pid")" 2>/dev/null || true
-    fi
-    rm -rf "${TEST_DIR}"
+  if [ -f "${TEST_DIR}/nginx.pid" ]; then
+    kill "$(cat "${TEST_DIR}/nginx.pid")" 2>/dev/null || true
+  fi
+  rm -rf "${TEST_DIR}"
 }
-
 trap cleanup EXIT
 
 pass() {
-    local name="$1"
-    echo "  PASS: ${name}"
-    PASS=$((PASS + 1))
+  echo "  PASS: $1"
+  PASS=$((PASS + 1))
 }
 
 fail() {
-    local name="$1"
-    shift
-    echo "  FAIL: ${name} — $*"
-    FAIL=$((FAIL + 1))
+  local name="$1"
+  shift
+  echo "  FAIL: ${name} — $*"
+  FAIL=$((FAIL + 1))
 }
 
 skip() {
-    local name="$1"
-    shift
-    echo "  SKIP: ${name} — $*"
-    SKIP=$((SKIP + 1))
+  local name="$1"
+  shift
+  echo "  SKIP: ${name} — $*"
+  SKIP=$((SKIP + 1))
 }
 
 assert_status() {
-    local name="$1"
-    local expected="$2"
-    local actual="$3"
-    if [ "${actual}" = "${expected}" ]; then
-        return 0
-    else
-        fail "${name}" "expected status ${expected}, got ${actual}"
-        return 1
-    fi
+  if [ "$3" = "$2" ]; then return 0; fi
+  fail "$1" "expected status $2, got $3"
+  return 1
 }
 
 assert_contains() {
-    local name="$1"
-    local body="$2"
-    local pattern="$3"
-    if echo "${body}" | grep -q "${pattern}"; then
-        return 0
-    else
-        fail "${name}" "body missing '${pattern}'"
-        return 1
-    fi
+  if grep -qF -- "$3" <<<"$2"; then return 0; fi
+  fail "$1" "body missing '$3'"
+  return 1
 }
 
 assert_not_contains() {
-    local name="$1"
-    local body="$2"
-    local pattern="$3"
-    if echo "${body}" | grep -q "${pattern}"; then
-        fail "${name}" "body unexpectedly contains '${pattern}'"
-        return 1
-    else
-        return 0
+  if ! grep -qF -- "$3" <<<"$2"; then return 0; fi
+  fail "$1" "body unexpectedly contains '$3'"
+  return 1
+}
+
+port_open() { (exec 3<>"/dev/tcp/127.0.0.1/$1") 2>/dev/null; }
+
+# Writes the template config for prefix $1 with extra location text $2.
+write_conf() {
+  local prefix=$1 extra=${2:-}
+  mkdir -p "${prefix}"/{client_body,proxy,fastcgi,uwsgi,scgi}
+  local line
+  while IFS= read -r line; do
+    if [[ "${line}" == *"@EXTRA@"* ]]; then
+      printf '        %s\n' "${extra}"
+      continue
     fi
+    line=${line//@MODULE@/${MODULE}}
+    line=${line//@PREFIX@/${prefix}}
+    line=${line//@PORT@/${PORT}}
+    printf '%s\n' "${line}"
+  done <"${SCRIPT_DIR}/nginx.conf" >"${prefix}/nginx.conf"
 }
 
 # ---------------------------------------------------------------------------
@@ -103,21 +99,46 @@ assert_not_contains() {
 echo "=== ngx-isonim E2E Tests ==="
 echo ""
 
-# Create temp directories for nginx
-mkdir -p "${TEST_DIR}"/{client_body,proxy,fastcgi,uwsgi,scgi}
-
-# Start nginx
-echo "Starting nginx..."
-nginx -c "${NGINX_CONF}" -p "${TEST_DIR}"
-sleep 1
-
-# Verify nginx is running
-if ! kill -0 "$(cat "${TEST_DIR}/nginx.pid")" 2>/dev/null; then
-    echo "FATAL: nginx did not start"
-    cat "${TEST_DIR}/error.log" 2>/dev/null
+MODULE="${NGX_ISONIM_E2E_MODULE:-}"
+if [ -z "${MODULE}" ]; then
+  MODULE="${TEST_DIR}/ngx_http_isonim_module.so"
+  echo "Building the module..."
+  if ! "${ROOT}/scripts/build-module.sh" release "${MODULE}" -d:ngxIsonimTestApps \
+    >"${TEST_DIR}/build.log" 2>&1; then
+    tail -40 "${TEST_DIR}/build.log"
+    echo "FATAL: module build failed"
     exit 1
+  fi
 fi
-echo "  nginx started (pid $(cat "${TEST_DIR}/nginx.pid"))"
+
+PORT=0
+for _ in $(seq 1 50); do
+  candidate=$((20000 + RANDOM % 30000))
+  if ! port_open "${candidate}"; then
+    PORT=${candidate}
+    break
+  fi
+done
+BASE_URL="http://127.0.0.1:${PORT}"
+
+write_conf "${TEST_DIR}"
+echo "Starting nginx..."
+if ! nginx -c "${TEST_DIR}/nginx.conf" -p "${TEST_DIR}" -e "${TEST_DIR}/error.log" \
+  </dev/null >"${TEST_DIR}/start.log" 2>&1; then
+  cat "${TEST_DIR}/start.log" "${TEST_DIR}/error.log" 2>/dev/null
+  echo "FATAL: nginx did not start"
+  exit 1
+fi
+for _ in $(seq 1 200); do
+  port_open "${PORT}" && break
+  sleep 0.05
+done
+if ! port_open "${PORT}"; then
+  echo "FATAL: nginx did not open port ${PORT}"
+  cat "${TEST_DIR}/error.log"
+  exit 1
+fi
+echo "  nginx started (pid $(cat "${TEST_DIR}/nginx.pid"), port ${PORT})"
 echo ""
 
 # ---------------------------------------------------------------------------
@@ -126,129 +147,172 @@ echo ""
 
 echo "--- Basic Tests ---"
 
-# Test: GET /hello
 echo "Test: GET /hello"
-STATUS=$(curl -s -o /tmp/ngx-isonim-test/hello_body -w "%{http_code}" "${BASE_URL}/hello")
-BODY=$(cat /tmp/ngx-isonim-test/hello_body)
-if assert_status "GET /hello status" "200" "${STATUS}" && \
-  assert_contains "GET /hello body" "${BODY}" "Hello from IsoNim" && \
+STATUS=$(curl -s -o "${TEST_DIR}/hello_body" -w "%{http_code}" "${BASE_URL}/hello")
+BODY=$(cat "${TEST_DIR}/hello_body")
+if assert_status "GET /hello status" "200" "${STATUS}" &&
+  assert_contains "GET /hello body" "${BODY}" "Hello from IsoNim" &&
   assert_contains "GET /hello html" "${BODY}" "<html>"; then
-    pass "GET /hello"
+  pass "GET /hello"
 fi
 
-# Test: GET /hello Content-Type
 echo "Test: GET /hello Content-Type"
 CONTENT_TYPE=$(curl -s -o /dev/null -w "%{content_type}" "${BASE_URL}/hello")
-if echo "${CONTENT_TYPE}" | grep -q "text/html"; then
-    pass "GET /hello Content-Type"
+if [ "${CONTENT_TYPE}" = "text/html; charset=utf-8" ]; then
+  pass "GET /hello Content-Type"
 else
-    fail "GET /hello Content-Type" "expected text/html, got ${CONTENT_TYPE}"
+  fail "GET /hello Content-Type" "expected text/html; charset=utf-8, got ${CONTENT_TYPE}"
 fi
 
-# Test: GET /hello without hydration (no script tag)
-echo "Test: GET /hello no hydration"
+echo "Test: streaming is the default transport, buffered on request"
+HEADERS=$(curl -s -D - -o /dev/null "${BASE_URL}/hello")
+BHEADERS=$(curl -s -D - -o /dev/null "${BASE_URL}/hello-buffered")
+if assert_contains "default transport" "${HEADERS}" "Transfer-Encoding: chunked" &&
+  assert_contains "buffered transport" "${BHEADERS}" "Content-Length: 52"; then
+  pass "transports"
+fi
+
+echo "Test: GET /hello without hydration (no script tag)"
 BODY=$(curl -s "${BASE_URL}/hello")
-if assert_not_contains "GET /hello no hydration" "${BODY}" "window._\$HY"; then
-    pass "GET /hello no hydration"
+if assert_not_contains "GET /hello no hydration" "${BODY}" 'window._$HY'; then
+  pass "GET /hello no hydration"
 fi
 
-# Test: GET /hello-hydrated with hydration
 echo "Test: GET /hello-hydrated"
 BODY=$(curl -s "${BASE_URL}/hello-hydrated")
-if assert_contains "GET /hello-hydrated" "${BODY}" "window._\$HY" && \
-  assert_contains "GET /hello-hydrated events" "${BODY}" "events:"; then
-    pass "GET /hello-hydrated"
+if assert_contains "GET /hello-hydrated" "${BODY}" 'window._$HY' &&
+  assert_contains "GET /hello-hydrated events" "${BODY}" "events:" &&
+  assert_contains "GET /hello-hydrated nonce" "${BODY}" '<script nonce="'; then
+  pass "GET /hello-hydrated"
 fi
 
-# Test: GET /hello-csp with CSP nonce
-echo "Test: GET /hello-csp"
-BODY=$(curl -s "${BASE_URL}/hello-csp")
-if assert_contains "GET /hello-csp nonce" "${BODY}" 'nonce="abc123"' && \
-  assert_contains "GET /hello-csp hydration" "${BODY}" "window._\$HY"; then
-    pass "GET /hello-csp"
+echo "Test: the script nonce differs between two responses"
+N1=$(curl -s "${BASE_URL}/hello-hydrated" | sed -n 's/.*<script nonce="\([^"]*\)".*/\1/p')
+N2=$(curl -s "${BASE_URL}/hello-hydrated" | sed -n 's/.*<script nonce="\([^"]*\)".*/\1/p')
+if [ -n "${N1}" ] && [ ${#N1} -eq 24 ] && [ "${N1}" != "${N2}" ]; then
+  pass "per-response nonce (${N1} != ${N2})"
+else
+  fail "per-response nonce" "got '${N1}' and '${N2}'"
 fi
 
-# Test: GET /tasks (real IsoNim SSR app)
-echo "Test: GET /tasks"
-STATUS=$(curl -s -o /tmp/ngx-isonim-test/tasks_body -w "%{http_code}" "${BASE_URL}/tasks")
-BODY=$(cat /tmp/ngx-isonim-test/tasks_body)
-if assert_status "GET /tasks status" "200" "${STATUS}" && \
-  assert_contains "GET /tasks title" "${BODY}" "IsoNim Task Manager" && \
-  assert_contains "GET /tasks task-list" "${BODY}" "task-list" && \
-  assert_contains "GET /tasks active count" "${BODY}" "3 active" && \
-  assert_contains "GET /tasks hydration" "${BODY}" "window._\$HY"; then
-    pass "GET /tasks"
+echo "Test: GET /tasks (real IsoNim SSR app)"
+STATUS=$(curl -s -o "${TEST_DIR}/tasks_body" -w "%{http_code}" "${BASE_URL}/tasks")
+BODY=$(cat "${TEST_DIR}/tasks_body")
+if assert_status "GET /tasks status" "200" "${STATUS}" &&
+  assert_contains "GET /tasks title" "${BODY}" "IsoNim Task Manager" &&
+  assert_contains "GET /tasks task-list" "${BODY}" "task-list" &&
+  assert_contains "GET /tasks active count" "${BODY}" "3 active" &&
+  assert_contains "GET /tasks hydration" "${BODY}" 'window._$HY'; then
+  pass "GET /tasks"
 fi
 
-# Test: GET /async (streaming)
-echo "Test: GET /async (streaming)"
-STATUS=$(curl -s -o /tmp/ngx-isonim-test/async_body -w "%{http_code}" "${BASE_URL}/async")
-BODY=$(cat /tmp/ngx-isonim-test/async_body)
-if assert_status "GET /async status" "200" "${STATUS}" && \
-  assert_contains "GET /async body" "${BODY}" "Dashboard"; then
-    pass "GET /async"
+echo "Test: GET /async (legacy streaming app)"
+STATUS=$(curl -s -o "${TEST_DIR}/async_body" -w "%{http_code}" "${BASE_URL}/async")
+BODY=$(cat "${TEST_DIR}/async_body")
+if assert_status "GET /async status" "200" "${STATUS}" &&
+  assert_contains "GET /async body" "${BODY}" "Dashboard" &&
+  assert_contains "GET /async boundary" "${BODY}" "Data loaded: 42 items"; then
+  pass "GET /async"
 fi
 
-# Test: HEAD /hello
-echo "Test: HEAD /hello"
-STATUS=$(curl -s -o /dev/null -I -w "%{http_code}" "${BASE_URL}/hello")
-BODY=$(curl -s -I "${BASE_URL}/hello")
-# Verify HEAD returns no body (size_download is 0 for -I)
-curl -s -o /dev/null -w "%{size_download}" -I "${BASE_URL}/hello" > /dev/null
-if assert_status "HEAD /hello status" "200" "${STATUS}"; then
-    # HEAD should return no body (size_download is 0 for -I)
-    pass "HEAD /hello"
+echo "Test: HEAD /hello-buffered"
+HEAD_OUT=$(curl -s -I -w "%{http_code} %{size_download}" "${BASE_URL}/hello-buffered")
+if assert_contains "HEAD status" "${HEAD_OUT}" "200 0" &&
+  assert_contains "HEAD length" "${HEAD_OUT}" "Content-Length: 52"; then
+  pass "HEAD /hello-buffered"
 fi
 
-# Test: POST /hello
 echo "Test: POST /hello"
 STATUS=$(curl -s -o /dev/null -w "%{http_code}" -X POST "${BASE_URL}/hello")
 if assert_status "POST /hello status" "405" "${STATUS}"; then
-    pass "POST /hello returns 405"
+  pass "POST /hello returns 405"
 fi
 
-# Test: GET /nonexistent
+echo "Test: a renderer that raises"
+STATUS=$(curl -s -o /dev/null -w "%{http_code}" "${BASE_URL}/boom")
+if assert_status "GET /boom" "500" "${STATUS}" &&
+  grep -q 'renderer raised ValueError: boom' "${TEST_DIR}/error.log"; then
+  pass "GET /boom returns 500 and logs the error"
+fi
+
+echo "Test: an unknown app"
+STATUS=$(curl -s -o /dev/null -w "%{http_code}" "${BASE_URL}/unknown-app")
+if assert_status "GET /unknown-app" "500" "${STATUS}" &&
+  grep -q 'no app is registered as "no_such_app"' "${TEST_DIR}/error.log"; then
+  pass "GET /unknown-app returns 500 and logs the name"
+fi
+
 echo "Test: GET /nonexistent"
 STATUS=$(curl -s -o /dev/null -w "%{http_code}" "${BASE_URL}/nonexistent")
 if assert_status "GET /nonexistent status" "404" "${STATUS}"; then
-    pass "GET /nonexistent returns 404"
+  pass "GET /nonexistent returns 404"
 fi
 
 echo ""
 
 # ---------------------------------------------------------------------------
-# Performance Tests (optional, requires wrk)
+# Configuration rejected by nginx -t
+# ---------------------------------------------------------------------------
+
+echo "--- Configuration ---"
+
+check_rejected() {
+  # $1 = name, $2 = location text, $3 = expected message
+  CONF_N=$((${CONF_N:-0} + 1))
+  local dir="${TEST_DIR}/conf-${CONF_N}"
+  write_conf "${dir}" "$2"
+  local out
+  out=$(nginx -t -c "${dir}/nginx.conf" -p "${dir}" -e "${dir}/error.log" 2>&1)
+  if [ $? -ne 0 ] && grep -qF -- "$3" <<<"${out}"; then
+    pass "nginx -t rejects $1"
+  else
+    fail "nginx -t rejects $1" "${out}"
+  fi
+}
+
+check_rejected "the removed fixed nonce directive" \
+  'location /x { isonim_ssr on; isonim_ssr_app hello; isonim_ssr_script_nonce abc123; }' \
+  'unknown directive "isonim_ssr_script_nonce"'
+check_rejected "isonim_ssr on without an app" \
+  'location /x { isonim_ssr on; }' \
+  '"isonim_ssr on" requires "isonim_ssr_app"'
+check_rejected "an unknown isonim_ssr_mode" \
+  'location /x { isonim_ssr on; isonim_ssr_app hello; isonim_ssr_mode chunked; }' \
+  'invalid value "chunked"'
+check_rejected "a negative isonim_ssr_max_buffer_size" \
+  'location /x { isonim_ssr on; isonim_ssr_app hello; isonim_ssr_max_buffer_size -1; }' \
+  'invalid value'
+
+echo ""
+
+# ---------------------------------------------------------------------------
+# Performance (optional, requires wrk)
 # ---------------------------------------------------------------------------
 
 echo "--- Performance Tests ---"
 
 if command -v wrk &>/dev/null; then
-    echo "Test: wrk /hello (2 threads, 10 connections, 5s)"
-    WRK_OUTPUT=$(wrk -t2 -c10 -d5s "${BASE_URL}/hello" 2>&1)
+  for path in /hello /tasks; do
+    echo "Test: wrk ${path} (2 threads, 10 connections, 5s)"
+    WRK_OUTPUT=$(wrk -t2 -c10 -d5s "${BASE_URL}${path}" 2>&1)
     echo "${WRK_OUTPUT}" | tail -4
-    if echo "${WRK_OUTPUT}" | grep -q "Requests/sec"; then
-        pass "wrk /hello completed"
+    if grep -q "Requests/sec" <<<"${WRK_OUTPUT}" &&
+      ! grep -q "Non-2xx" <<<"${WRK_OUTPUT}" &&
+      ! grep -q "Socket errors" <<<"${WRK_OUTPUT}"; then
+      pass "wrk ${path} completed without errors"
     else
-        fail "wrk /hello" "no output"
+      fail "wrk ${path}" "${WRK_OUTPUT}"
     fi
-
-    echo "Test: wrk /tasks (2 threads, 10 connections, 5s)"
-    WRK_OUTPUT=$(wrk -t2 -c10 -d5s "${BASE_URL}/tasks" 2>&1)
-    echo "${WRK_OUTPUT}" | tail -4
-    if echo "${WRK_OUTPUT}" | grep -q "Requests/sec"; then
-        pass "wrk /tasks completed"
-    else
-        fail "wrk /tasks" "no output"
-    fi
+  done
 else
-    skip "wrk /hello" "wrk not found in PATH"
-    skip "wrk /tasks" "wrk not found in PATH"
+  skip "wrk /hello" "wrk not found in PATH"
+  skip "wrk /tasks" "wrk not found in PATH"
 fi
 
 echo ""
 
 # ---------------------------------------------------------------------------
-# Health endpoint (sanity)
+# Health endpoint and worker health
 # ---------------------------------------------------------------------------
 
 echo "--- Health Check ---"
@@ -256,7 +320,13 @@ echo "--- Health Check ---"
 echo "Test: GET /health"
 STATUS=$(curl -s -o /dev/null -w "%{http_code}" "${BASE_URL}/health")
 if assert_status "GET /health" "200" "${STATUS}"; then
-    pass "GET /health"
+  pass "GET /health"
+fi
+
+if ! grep -qE "exited on signal|\[alert\]|\[emerg\]|\[crit\]" "${TEST_DIR}/error.log"; then
+  pass "no worker crashed"
+else
+  fail "worker health" "$(grep -E "exited on signal|\[alert\]|\[emerg\]|\[crit\]" "${TEST_DIR}/error.log" | head -3)"
 fi
 
 echo ""
@@ -269,9 +339,10 @@ TOTAL=$((PASS + FAIL + SKIP))
 echo "=== Results: ${PASS} passed, ${FAIL} failed, ${SKIP} skipped (${TOTAL} total) ==="
 
 if [ "${FAIL}" -gt 0 ]; then
-    echo ""
-    echo "Some tests failed. Check ${TEST_DIR}/error.log for nginx errors."
-    exit 1
+  echo ""
+  echo "Some tests failed. nginx error log:"
+  tail -20 "${TEST_DIR}/error.log"
+  exit 1
 fi
 
 echo ""

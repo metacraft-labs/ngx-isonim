@@ -25,7 +25,7 @@ just build
 # Run unit tests (mock mode, no real nginx needed)
 just test
 
-# Run E2E tests against real nginx
+# Run E2E tests against real nginx (builds the module with the test apps)
 just test-e2e
 ```
 
@@ -33,19 +33,24 @@ just test-e2e
 
 ```
 src/
-  nginx_types.nim         # nginx C API bindings
-  config.nim              # Directive parsing
-  nginx_adapter.nim       # faststreams OutputStreamVTable for nginx
-  handler.nim             # Request handler
-  ngx_http_isonim_module.c  # Module registration (C boilerplate)
+  ngx_http_isonim_module.c  # Module registration, directives, C helpers
+  handler.nim             # Nim entry point (nim_handle_request)
+  serve.nim               # The request pipeline (shared with the unit tests)
+  request.nim             # SsrRequest: what a renderer receives
+  response.nim            # SsrResponse: status, headers, cookies, redirects, CSP nonce
+  response_body.nim       # ResponseBody: the streaming writer
+  app_registry.nim        # App name -> renderer
+  ssr_router.nim          # routedApp: per-request routing via IsoNim's SSR router
+  config.nim              # Directive model
+  nginx_types.nim         # nginx C API bindings (and their mocks)
+scripts/
+  build-module.sh         # The module build (release or debug)
 tests/
-  test_adapter.nim        # Adapter unit tests
-  test_handler.nim        # Handler logic tests
-  test_config.nim         # Config parsing tests
+  test_*.nim              # Unit tests (mock mode)
   e2e/                    # E2E tests against real nginx
 nix/
   nginx-dev-headers.nix   # Extracts configured nginx headers
-  ngx-isonim-module.nix   # Builds the .so module
+  ngx-isonim-module.nix   # Builds the .so module (runs build-module.sh)
   nginx-with-isonim.nix   # Wraps nginx with the module
 ```
 
@@ -55,8 +60,23 @@ nix/
 location /app {
     isonim_ssr on;
     isonim_ssr_app my_app;
-    isonim_ssr_hydration on;
-    isonim_ssr_script_nonce "abc123";
-    isonim_ssr_max_buffer_size 1048576;
+    isonim_ssr_hydration on;          # bootstrap script with a per-response CSP nonce
+    isonim_ssr_mode streaming;        # default; or: buffered
+    isonim_ssr_max_buffer_size 1m;    # 0 (default) = unlimited
 }
 ```
+
+## Writing an App
+
+```nim
+registerApp("my_app", proc(req: SsrRequest; resp: SsrResponse): string =
+  if not req.hasCookie("sid"):
+    resp.redirect("/login", 303)
+    return ""
+  resp.setHeader("Cache-Control", "private, no-cache, must-revalidate")
+  resp.setHeader("Content-Security-Policy",
+                 "script-src 'self' " & resp.cspNonceSource)
+  "<h1>Hello " & req.queryParam("name", "world") & "</h1>")
+```
+
+See `isonim-specs/isonim-nginx.md` for the full contract.

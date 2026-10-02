@@ -1,672 +1,160 @@
 ## test_e2e_integration.nim
 ##
-## E2E integration tests that exercise the full handler pipeline
-## (app registry -> handler -> adapter -> response) without a real
-## nginx process.
+## The module's request flow end to end, short of nginx itself: a request
+## as nginx parsed it, the location configuration, the app registry, the
+## pipeline, and the response the sink receives.  Mirrors the scenarios
+## tests/e2e/test_e2e.sh runs over real nginx, plus a throughput check.
 ##
-## These tests simulate what the curl-based E2E tests would verify:
-## status codes, Content-Type, body content, hydration markers, etc.
+## Mocks: `newMockRequest` stands in for `ngx_http_request_t` and the
+## recording sink for nginx's filters (handler.nim `serveMockRequest`).  The
+## pipeline and the request mapping are the module's own code.
 ##
 ## Compile with: nim c -r -d:isNginxTest tests/test_e2e_integration.nim
 
 import unittest
 import std/[strutils, times]
 import ../src/nginx_types
-import ../src/config
-import ../src/app_registry
-import ../src/nginx_adapter
 import ../src/handler
 import e2e/apps/hello
 import e2e/apps/counter
 import e2e/apps/task_manager
 import e2e/apps/async_app
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
+proc conf(app: string; hydration = false; mode = tmStreaming;
+          maxBufferSize = 0): IsoNimLocConf =
+  parseLocConf(enabled = true, appName = app, hydrationEnabled = hydration,
+               mode = mode, maxBufferSize = maxBufferSize)
 
-proc newTestStream(): tuple[req: NgxHttpRequest, stream: NginxOutputStream] =
-  let req = newMockRequest(uri = "/", httpMethod = "GET")
-  let stream = newNginxOutputStream(req)
-  (req, stream)
+proc request(uri: string; meth = "GET"; args = "";
+             headers: seq[(string, string)] = @[]): NgxHttpRequest =
+  result = newMockRequest(uri = uri, httpMethod = meth)
+  result.args = args
+  result.headers = headers
 
-proc getHeader(res: HandlerResult; key: string): string =
-  for (k, v) in res.headers:
-    if k == key:
-      return v
-  return ""
-
-proc hasHeader(res: HandlerResult; key: string; value: string): bool =
-  for (k, v) in res.headers:
-    if k == key and v == value:
-      return true
-  return false
-
-# ---------------------------------------------------------------------------
-# E2E Integration - Hello App
-# ---------------------------------------------------------------------------
+proc registerFixtures() =
+  clearApps()
+  registerApp("hello", helloApp)
+  registerApp("task_manager", proc(): string = taskManagerDetailApp())
+  registerApp("custom_tasks", proc(req: SsrRequest; resp: SsrResponse): string =
+    taskManagerDetailApp(req.queryParam("tasks").split(',')))
+  registerApp("counter", proc(req: SsrRequest; resp: SsrResponse): string =
+    counterApp(parseInt(req.queryParam("count", "0"))))
+  registerStreamingApp("async_dashboard", asyncStreamingApp)
 
 suite "E2E Integration - Hello App":
   setup:
-    resetMockState()
-    clearApps()
-    registerApp("hello", helloApp)
+    registerFixtures()
 
-  test "GET /hello returns 200 with HTML body":
-    let conf = parseLocConf(
-      enabled = true,
-      appName = "hello",
-      hydrationEnabled = false,
-    )
-    let reqInfo = RequestInfo(uri:"/hello", httpMethod: "GET", headers: @[])
-    let app = getApp("hello")
-    let res = handleSsrRequest(conf, reqInfo, app)
+  test "GET /hello returns 200 with the page":
+    for mode in [tmStreaming, tmBuffered]:
+      let rec = serveMockRequest(conf("hello", mode = mode), request("/hello"))
+      check rec.rc == NGX_OK
+      check rec.status == 200
+      check rec.contentType == "text/html; charset=utf-8"
+      check rec.body == "<html><body><h1>Hello from IsoNim</h1></body></html>"
 
-    check res.statusCode == 200
-    check res.hasHeader("Content-Type", "text/html; charset=utf-8")
-    check res.body.contains("<h1>Hello from IsoNim</h1>")
-    check res.body.contains("<html>")
-    check res.body.contains("</html>")
+  test "buffered Content-Length matches the body":
+    let rec = serveMockRequest(conf("hello", hydration = true, mode = tmBuffered),
+                               request("/hello"))
+    check rec.contentLength == rec.body.len
+    check rec.body.len > "<html><body><h1>Hello from IsoNim</h1></body></html>".len
 
-  test "GET /hello Content-Length matches body length":
-    let conf = parseLocConf(
-      enabled = true,
-      appName = "hello",
-      hydrationEnabled = false,
-    )
-    let reqInfo = RequestInfo(uri:"/hello", httpMethod: "GET", headers: @[])
-    let app = getApp("hello")
-    let res = handleSsrRequest(conf, reqInfo, app)
+  test "streaming responses are chunked (no Content-Length)":
+    let rec = serveMockRequest(conf("hello"), request("/hello"))
+    check rec.contentLength == -1
 
-    check res.statusCode == 200
-    check res.getHeader("Content-Length") == $res.body.len
+  test "HEAD returns the headers and no body":
+    let rec = serveMockRequest(conf("hello", mode = tmBuffered),
+                               request("/hello", "HEAD"))
+    check rec.rc == NGX_OK
+    check rec.status == 200
+    check rec.contentLength == "<html><body><h1>Hello from IsoNim</h1></body></html>".len
+    check rec.body == ""
 
-  test "GET /hello without hydration has no script tag":
-    let conf = parseLocConf(
-      enabled = true,
-      appName = "hello",
-      hydrationEnabled = false,
-    )
-    let reqInfo = RequestInfo(uri:"/hello", httpMethod: "GET", headers: @[])
-    let app = getApp("hello")
-    let res = handleSsrRequest(conf, reqInfo, app)
+  test "POST, PUT and DELETE return 405":
+    for m in ["POST", "PUT", "DELETE"]:
+      check serveMockRequest(conf("hello"), request("/hello", m)).rc ==
+        NGX_HTTP_NOT_ALLOWED
 
-    check res.statusCode == 200
-    check not res.body.contains("<script>")
-    check not res.body.contains("window._$HY")
-
-  test "HEAD /hello returns 200 with headers but empty body":
-    let conf = parseLocConf(
-      enabled = true,
-      appName = "hello",
-      hydrationEnabled = false,
-    )
-    let reqInfo = RequestInfo(uri:"/hello", httpMethod: "HEAD", headers: @[])
-    let app = getApp("hello")
-    let res = handleSsrRequest(conf, reqInfo, app)
-
-    check res.statusCode == 200
-    check res.body == ""
-    check res.chunks.len == 0
-    check res.hasHeader("Content-Type", "text/html; charset=utf-8")
-    # Content-Length still set for HEAD
-    let cl = res.getHeader("Content-Length")
-    check cl.len > 0
-    check parseInt(cl) > 0
-
-  test "POST /hello returns 405":
-    let conf = parseLocConf(
-      enabled = true,
-      appName = "hello",
-    )
-    let reqInfo = RequestInfo(uri:"/hello", httpMethod: "POST", headers: @[])
-    let app = getApp("hello")
-    let res = handleSsrRequest(conf, reqInfo, app)
-
-    check res.statusCode == 405
-    check res.body.contains("Method Not Allowed")
-
-  test "full nimHandleRequest flow writes to output stream":
-    testLocConf = parseLocConf(
-      enabled = true,
-      appName = "hello",
-      hydrationEnabled = false,
-    )
-    let req = newMockRequest(uri = "/hello", httpMethod = "GET")
-    resetMockState()
-    let rc = nimHandleRequest(req)
-
-    check rc == NGX_OK
-    check lastHandlerResult.statusCode == 200
-    check lastHandlerResult.body.contains("Hello from IsoNim")
-    # Output stream was used (flush + close = at least 2 output_filter calls)
-    check mockOutputFilterCalls >= 1
-
-
-# ---------------------------------------------------------------------------
-# E2E Integration - Task Manager
-# ---------------------------------------------------------------------------
-
-suite "E2E Integration - Task Manager":
+suite "E2E Integration - apps reading the request":
   setup:
-    resetMockState()
-    clearApps()
-    registerApp("task_manager", proc(): string = taskManagerDetailApp())
+    registerFixtures()
 
-  test "GET /tasks returns 200 with task list":
-    let conf = parseLocConf(
-      enabled = true,
-      appName = "task_manager",
-      hydrationEnabled = true,
-    )
-    let reqInfo = RequestInfo(uri:"/tasks", httpMethod: "GET", headers: @[])
-    let app = getApp("task_manager")
-    let res = handleSsrRequest(conf, reqInfo, app)
+  test "task manager renders the tasks from the query":
+    let rec = serveMockRequest(conf("custom_tasks"),
+      request("/tasks", args = "tasks=Alpha,Beta"))
+    check "<li>Alpha</li><li>Beta</li>" in rec.body
+    check "2 items" in rec.body
 
-    check res.statusCode == 200
-    check res.body.contains("<h1>Task Manager</h1>")
-    check res.body.contains("<li>Task 1</li>")
-    check res.body.contains("<li>Task 2</li>")
-    check res.body.contains("<li>Task 3</li>")
-    check res.body.contains("3 items")
+  test "default task manager":
+    let rec = serveMockRequest(conf("task_manager"), request("/tasks"))
+    check "<li>Task 1</li>" in rec.body
+    check "3 items" in rec.body
 
-  test "GET /tasks has hydration script when enabled":
-    let conf = parseLocConf(
-      enabled = true,
-      appName = "task_manager",
-      hydrationEnabled = true,
-    )
-    let reqInfo = RequestInfo(uri:"/tasks", httpMethod: "GET", headers: @[])
-    let app = getApp("task_manager")
-    let res = handleSsrRequest(conf, reqInfo, app)
-
-    check res.statusCode == 200
-    check res.body.contains("window._$HY")
-
-  test "task manager with custom tasks":
-    registerApp("task_manager_custom", proc(): string =
-      taskManagerDetailApp(@["Buy milk", "Write code"]))
-    let conf = parseLocConf(
-      enabled = true,
-      appName = "task_manager_custom",
-      hydrationEnabled = false,
-    )
-    let reqInfo = RequestInfo(uri:"/tasks", httpMethod: "GET", headers: @[])
-    let app = getApp("task_manager_custom")
-    let res = handleSsrRequest(conf, reqInfo, app)
-
-    check res.statusCode == 200
-    check res.body.contains("Buy milk")
-    check res.body.contains("Write code")
-    check res.body.contains("2 items")
-
-  test "full nimHandleRequest flow for task manager":
-    testLocConf = parseLocConf(
-      enabled = true,
-      appName = "task_manager",
-      hydrationEnabled = true,
-    )
-    let req = newMockRequest(uri = "/tasks", httpMethod = "GET")
-    resetMockState()
-    let rc = nimHandleRequest(req)
-
-    check rc == NGX_OK
-    check lastHandlerResult.statusCode == 200
-    check lastHandlerResult.body.contains("Task Manager")
-    check lastHandlerResult.body.contains("window._$HY")
-
-
-# ---------------------------------------------------------------------------
-# E2E Integration - Counter App
-# ---------------------------------------------------------------------------
-
-suite "E2E Integration - Counter App":
-  setup:
-    resetMockState()
-    clearApps()
-
-  test "counter with default count":
-    registerApp("counter", proc(): string = counterApp())
-    let conf = parseLocConf(
-      enabled = true,
-      appName = "counter",
-      hydrationEnabled = false,
-    )
-    let reqInfo = RequestInfo(uri:"/counter", httpMethod: "GET", headers: @[])
-    let app = getApp("counter")
-    let res = handleSsrRequest(conf, reqInfo, app)
-
-    check res.statusCode == 200
-    check res.body.contains("Count: 0")
-    check res.body.contains("<button>+1</button>")
-
-  test "counter with custom count":
-    registerApp("counter_42", proc(): string = counterApp(42))
-    let conf = parseLocConf(
-      enabled = true,
-      appName = "counter_42",
-      hydrationEnabled = false,
-    )
-    let reqInfo = RequestInfo(uri:"/counter", httpMethod: "GET", headers: @[])
-    let app = getApp("counter_42")
-    let res = handleSsrRequest(conf, reqInfo, app)
-
-    check res.statusCode == 200
-    check res.body.contains("Count: 42")
-
-
-# ---------------------------------------------------------------------------
-# E2E Integration - Streaming
-# ---------------------------------------------------------------------------
+  test "counter renders the count from the query":
+    check "Count: 0" in serveMockRequest(conf("counter"), request("/c")).body
+    check "Count: 41" in serveMockRequest(conf("counter"),
+      request("/c", args = "count=41")).body
 
 suite "E2E Integration - Streaming":
   setup:
-    resetMockState()
-    clearApps()
+    registerFixtures()
 
-  test "hello streaming app emits single content chunk":
-    registerStreamingApp("hello_stream", helloStreamingApp)
-    let app = getStreamingApp("hello_stream")
-    let conf = parseLocConf(
-      enabled = true,
-      appName = "hello_stream",
-      hydrationEnabled = false,
-    )
-    let reqInfo = RequestInfo(uri:"/hello", httpMethod: "GET", headers: @[])
-    let (req, stream) = newTestStream()
+  test "async dashboard emits the shell, then the boundaries, then the end":
+    let rec = serveMockRequest(conf("async_dashboard", hydration = true),
+                               request("/async"))
+    check rec.rc == NGX_OK
+    check rec.sends[0].data.contains("<h1>Dashboard</h1>")
+    check rec.sends[1].data.contains("Data loaded: 42 items")
+    check rec.sends[2].data.contains("Loaded at server time")
+    check rec.sends[3].data == "</body></html>"
+    check rec.sends[4].data.startsWith("<script nonce=")
+    check rec.sends[4].last
 
-    let (res, metrics) = handleStreamingRequest(conf, reqInfo, stream, app)
-
-    check res.statusCode == 200
-    check res.hasHeader("Transfer-Encoding", "chunked")
-    check res.chunks.len == 1
-    check res.body.contains("Hello from IsoNim")
-    check metrics.chunkCount == 1
-
-  test "async dashboard streaming emits shell then boundaries":
-    registerStreamingApp("async_dashboard", asyncStreamingApp)
-    let app = getStreamingApp("async_dashboard")
-    let conf = parseLocConf(
-      enabled = true,
-      appName = "async_dashboard",
-      hydrationEnabled = true,
-    )
-    let reqInfo = RequestInfo(uri:"/async", httpMethod: "GET", headers: @[])
-    let (req, stream) = newTestStream()
-
-    let (res, metrics) = handleStreamingRequest(conf, reqInfo, stream, app)
-
-    check res.statusCode == 200
-    check res.hasHeader("Transfer-Encoding", "chunked")
-    # 4 app chunks + 1 hydration script = 5
-    check res.chunks.len == 5
-    # Shell chunk contains the page structure
-    check res.chunks[0].contains("<h1>Dashboard</h1>")
-    check res.chunks[0].contains("Loading...")
-    # Boundary 1 resolves with data
-    check res.chunks[1].contains("Data loaded: 42 items")
-    # Boundary 2 resolves with footer
-    check res.chunks[2].contains("Loaded at server time")
-    # Closing tag
-    check res.chunks[3] == "</body></html>"
-    # Last chunk is hydration script
-    check res.chunks[4].contains("window._$HY")
-
-  test "streaming TTFB metric is set":
-    registerStreamingApp("async_dashboard", asyncStreamingApp)
-    let app = getStreamingApp("async_dashboard")
-    let conf = parseLocConf(
-      enabled = true,
-      appName = "async_dashboard",
-      hydrationEnabled = false,
-    )
-    let reqInfo = RequestInfo(uri:"/async", httpMethod: "GET", headers: @[])
-    let (req, stream) = newTestStream()
-
-    let (res, metrics) = handleStreamingRequest(conf, reqInfo, stream, app)
-
-    check res.statusCode == 200
-    check metrics.ttfbMs >= 0.0
-    check metrics.totalMs >= metrics.ttfbMs
-    check metrics.chunkCount == 4  # 4 app chunks, no hydration
-
-  test "streaming with hydration script has nonce":
-    registerStreamingApp("hello_stream", helloStreamingApp)
-    let app = getStreamingApp("hello_stream")
-    let conf = parseLocConf(
-      enabled = true,
-      appName = "hello_stream",
-      hydrationEnabled = true,
-      scriptNonce = "test-nonce-e2e",
-    )
-    let reqInfo = RequestInfo(uri:"/hello", httpMethod: "GET", headers: @[])
-    let (req, stream) = newTestStream()
-
-    let (res, metrics) = handleStreamingRequest(conf, reqInfo, stream, app)
-
-    check res.statusCode == 200
-    check res.chunks[^1].contains("nonce=\"test-nonce-e2e\"")
-    check res.chunks[^1].contains("window._$HY")
-
-  test "streaming without hydration has no script appended":
-    registerStreamingApp("async_dashboard", asyncStreamingApp)
-    let app = getStreamingApp("async_dashboard")
-    let conf = parseLocConf(
-      enabled = true,
-      appName = "async_dashboard",
-      hydrationEnabled = false,
-    )
-    let reqInfo = RequestInfo(uri:"/async", httpMethod: "GET", headers: @[])
-    let (req, stream) = newTestStream()
-
-    let (res, metrics) = handleStreamingRequest(conf, reqInfo, stream, app)
-
-    check res.statusCode == 200
-    check res.chunks.len == 4  # Only app chunks, no hydration
-    for chunk in res.chunks:
-      check not chunk.contains("window._$HY")
-
-  test "streaming Content-Type is text/html":
-    registerStreamingApp("hello_stream", helloStreamingApp)
-    let app = getStreamingApp("hello_stream")
-    let conf = parseLocConf(
-      enabled = true,
-      appName = "hello_stream",
-      hydrationEnabled = false,
-    )
-    let reqInfo = RequestInfo(uri:"/hello", httpMethod: "GET", headers: @[])
-    let (req, stream) = newTestStream()
-
-    let (res, metrics) = handleStreamingRequest(conf, reqInfo, stream, app)
-
-    check res.statusCode == 200
-    check res.hasHeader("Content-Type", "text/html; charset=utf-8")
-
-
-# ---------------------------------------------------------------------------
-# E2E Integration - Error Scenarios
-# ---------------------------------------------------------------------------
+  test "streaming without hydration ends with an empty last buffer":
+    let rec = serveMockRequest(conf("async_dashboard"), request("/async"))
+    check rec.sends[^1].data == ""
+    check rec.sends[^1].last
+    check "window._$HY" notin rec.body
 
 suite "E2E Integration - Error Scenarios":
   setup:
-    resetMockState()
-    clearApps()
+    registerFixtures()
 
-  test "unregistered app returns 404":
-    let conf = parseLocConf(
-      enabled = true,
-      appName = "nonexistent",
-    )
-    let reqInfo = RequestInfo(uri:"/nonexistent", httpMethod: "GET", headers: @[])
-    let app = getApp("nonexistent")
-    let res = handleSsrRequest(conf, reqInfo, app)
-
-    check res.statusCode == 404
-    check res.body.contains("app not found")
-
-  test "unregistered app via nimHandleRequest returns 404":
-    testLocConf = parseLocConf(
-      enabled = true,
-      appName = "nonexistent",
-    )
-    let req = newMockRequest(uri = "/nonexistent", httpMethod = "GET")
-    let rc = nimHandleRequest(req)
-
-    check rc == NGX_HTTP_NOT_FOUND
-
-  test "invalid config (enabled but no app name) returns 500":
-    let conf = parseLocConf(enabled = true, appName = "")
-    let reqInfo = RequestInfo(uri:"/bad", httpMethod: "GET", headers: @[])
-    let app: AppRenderer = proc(): string = "should not render"
-    let res = handleSsrRequest(conf, reqInfo, app)
-
-    check res.statusCode == 500
-    check res.body.contains("invalid configuration")
-
-  test "POST method returns 405":
-    registerApp("hello", helloApp)
-    let conf = parseLocConf(enabled = true, appName = "hello")
-    let reqInfo = RequestInfo(uri:"/hello", httpMethod: "POST", headers: @[])
-    let app = getApp("hello")
-    let res = handleSsrRequest(conf, reqInfo, app)
-
-    check res.statusCode == 405
-
-  test "PUT method returns 405":
-    registerApp("hello", helloApp)
-    let conf = parseLocConf(enabled = true, appName = "hello")
-    let reqInfo = RequestInfo(uri:"/hello", httpMethod: "PUT", headers: @[])
-    let app = getApp("hello")
-    let res = handleSsrRequest(conf, reqInfo, app)
-
-    check res.statusCode == 405
-
-  test "DELETE method returns 405":
-    registerApp("hello", helloApp)
-    let conf = parseLocConf(enabled = true, appName = "hello")
-    let reqInfo = RequestInfo(uri:"/hello", httpMethod: "DELETE", headers: @[])
-    let app = getApp("hello")
-    let res = handleSsrRequest(conf, reqInfo, app)
-
-    check res.statusCode == 405
+  test "unregistered app returns 500":
+    let rec = serveMockRequest(conf("nonexistent"), request("/x"))
+    check rec.rc == NGX_HTTP_INTERNAL_SERVER_ERROR
+    check "nonexistent" in rec.log[0][1]
 
   test "app render failure returns 500":
-    registerApp("broken", proc(): string =
-      raise newException(ValueError, "render crashed"))
-    let conf = parseLocConf(enabled = true, appName = "broken")
-    let reqInfo = RequestInfo(uri:"/broken", httpMethod: "GET", headers: @[])
-    let app = getApp("broken")
-    let res = handleSsrRequest(conf, reqInfo, app)
+    registerApp("failing", proc(): string = raise newException(ValueError, "x"))
+    check serveMockRequest(conf("failing"), request("/f")).rc ==
+      NGX_HTTP_INTERNAL_SERVER_ERROR
 
-    check res.statusCode == 500
-    check res.body.contains("render error")
-
-  test "streaming app nil returns 404":
-    let conf = parseLocConf(enabled = true, appName = "missing")
-    let reqInfo = RequestInfo(uri:"/missing", httpMethod: "GET", headers: @[])
-    let (req, stream) = newTestStream()
-    let (res, metrics) = handleStreamingRequest(conf, reqInfo, stream, nil)
-
-    check res.statusCode == 404
-
-  test "streaming POST returns 405":
-    registerStreamingApp("hello_stream", helloStreamingApp)
-    let app = getStreamingApp("hello_stream")
-    let conf = parseLocConf(enabled = true, appName = "hello_stream")
-    let reqInfo = RequestInfo(uri:"/hello", httpMethod: "POST", headers: @[])
-    let (req, stream) = newTestStream()
-    let (res, metrics) = handleStreamingRequest(conf, reqInfo, stream, app)
-
-    check res.statusCode == 405
-
-
-# ---------------------------------------------------------------------------
-# E2E Integration - Hydration
-# ---------------------------------------------------------------------------
-
-suite "E2E Integration - Hydration":
-  setup:
-    resetMockState()
-    clearApps()
-    registerApp("hello", helloApp)
-
-  test "hydration enabled appends _$HY script":
-    let conf = parseLocConf(
-      enabled = true,
-      appName = "hello",
-      hydrationEnabled = true,
-    )
-    let reqInfo = RequestInfo(uri:"/hello-hydrated", httpMethod: "GET", headers: @[])
-    let app = getApp("hello")
-    let res = handleSsrRequest(conf, reqInfo, app)
-
-    check res.statusCode == 200
-    check res.body.contains("window._$HY")
-    check res.body.contains("events:[\"click\",\"input\"]")
-    check res.body.contains("completed:new WeakSet")
-    check res.body.contains("registry:new Map")
-
-  test "hydration disabled has no _$HY script":
-    let conf = parseLocConf(
-      enabled = true,
-      appName = "hello",
-      hydrationEnabled = false,
-    )
-    let reqInfo = RequestInfo(uri:"/hello", httpMethod: "GET", headers: @[])
-    let app = getApp("hello")
-    let res = handleSsrRequest(conf, reqInfo, app)
-
-    check res.statusCode == 200
-    check not res.body.contains("window._$HY")
-    check not res.body.contains("<script>")
-
-  test "CSP nonce included in hydration script":
-    let conf = parseLocConf(
-      enabled = true,
-      appName = "hello",
-      hydrationEnabled = true,
-      scriptNonce = "abc123",
-    )
-    let reqInfo = RequestInfo(uri:"/hello-csp", httpMethod: "GET", headers: @[])
-    let app = getApp("hello")
-    let res = handleSsrRequest(conf, reqInfo, app)
-
-    check res.statusCode == 200
-    check res.body.contains("nonce=\"abc123\"")
-    check res.body.contains("window._$HY")
-
-  test "CSP nonce empty means no nonce attribute":
-    let conf = parseLocConf(
-      enabled = true,
-      appName = "hello",
-      hydrationEnabled = true,
-      scriptNonce = "",
-    )
-    let reqInfo = RequestInfo(uri:"/hello-hydrated", httpMethod: "GET", headers: @[])
-    let app = getApp("hello")
-    let res = handleSsrRequest(conf, reqInfo, app)
-
-    check res.statusCode == 200
-    check res.body.contains("<script>window._$HY")
-    check not res.body.contains("nonce=")
-
-  test "hydration Content-Length includes script bytes":
-    let conf = parseLocConf(
-      enabled = true,
-      appName = "hello",
-      hydrationEnabled = true,
-    )
-    let reqInfo = RequestInfo(uri:"/hello-hydrated", httpMethod: "GET", headers: @[])
-    let app = getApp("hello")
-    let res = handleSsrRequest(conf, reqInfo, app)
-
-    check res.statusCode == 200
-    let cl = parseInt(res.getHeader("Content-Length"))
-    # Content-Length must account for both the HTML and the hydration script
-    check cl == res.body.len
-    check cl > helloApp().len  # Longer than HTML alone
-
-  test "streaming hydration appended as last chunk":
-    registerStreamingApp("hello_stream", helloStreamingApp)
-    let app = getStreamingApp("hello_stream")
-    let conf = parseLocConf(
-      enabled = true,
-      appName = "hello_stream",
-      hydrationEnabled = true,
-    )
-    let reqInfo = RequestInfo(uri:"/hello", httpMethod: "GET", headers: @[])
-    let (req, stream) = newTestStream()
-
-    let (res, metrics) = handleStreamingRequest(conf, reqInfo, stream, app)
-
-    check res.statusCode == 200
-    check res.chunks[^1].contains("window._$HY")
-    # Hydration is the last chunk, not mixed into content
-    check not res.chunks[0].contains("window._$HY")
-
-
-# ---------------------------------------------------------------------------
-# E2E Integration - Performance
-# ---------------------------------------------------------------------------
+  test "over the size limit returns 500 on the buffered transport":
+    let rec = serveMockRequest(
+      conf("hello", mode = tmBuffered, maxBufferSize = 10), request("/hello"))
+    check rec.rc == NGX_HTTP_INTERNAL_SERVER_ERROR
+    check not rec.headersSent
 
 suite "E2E Integration - Performance":
   setup:
-    resetMockState()
-    clearApps()
-    registerApp("hello", helloApp)
-    registerApp("task_manager", proc(): string = taskManagerDetailApp())
-    registerStreamingApp("async_dashboard", asyncStreamingApp)
+    registerFixtures()
 
-  test "1000 sync requests complete in under 1 second":
-    let conf = parseLocConf(
-      enabled = true,
-      appName = "hello",
-      hydrationEnabled = true,
-    )
-    let reqInfo = RequestInfo(uri:"/hello", httpMethod: "GET", headers: @[])
-    let app = getApp("hello")
-
+  test "1000 buffered requests complete in under 1 second":
+    let c = conf("hello", hydration = true, mode = tmBuffered)
     let start = cpuTime()
     for i in 0 ..< 1000:
-      let res = handleSsrRequest(conf, reqInfo, app)
-      check res.statusCode == 200
+      check serveMockRequest(c, request("/hello")).rc == NGX_OK
     let elapsed = (cpuTime() - start) * 1000.0
-
-    echo "  1000 sync requests: ", elapsed.formatFloat(ffDecimal, 1), " ms"
-    check elapsed < 1000.0  # Should complete well under 1 second
-
-  test "1000 task manager requests complete in under 1 second":
-    let conf = parseLocConf(
-      enabled = true,
-      appName = "task_manager",
-      hydrationEnabled = true,
-    )
-    let reqInfo = RequestInfo(uri:"/tasks", httpMethod: "GET", headers: @[])
-    let app = getApp("task_manager")
-
-    let start = cpuTime()
-    for i in 0 ..< 1000:
-      let res = handleSsrRequest(conf, reqInfo, app)
-      check res.statusCode == 200
-    let elapsed = (cpuTime() - start) * 1000.0
-
-    echo "  1000 task manager requests: ", elapsed.formatFloat(ffDecimal, 1), " ms"
+    echo "  1000 buffered requests: ", elapsed.formatFloat(ffDecimal, 1), " ms"
     check elapsed < 1000.0
 
   test "1000 streaming requests complete in under 2 seconds":
-    let conf = parseLocConf(
-      enabled = true,
-      appName = "async_dashboard",
-      hydrationEnabled = true,
-    )
-    let reqInfo = RequestInfo(uri:"/async", httpMethod: "GET", headers: @[])
-    let app = getStreamingApp("async_dashboard")
-
+    let c = conf("async_dashboard", hydration = true)
     let start = cpuTime()
     for i in 0 ..< 1000:
-      resetMockState()
-      let (req, stream) = newTestStream()
-      let (res, metrics) = handleStreamingRequest(conf, reqInfo, stream, app)
-      check res.statusCode == 200
+      check serveMockRequest(c, request("/async")).rc == NGX_OK
     let elapsed = (cpuTime() - start) * 1000.0
-
     echo "  1000 streaming requests: ", elapsed.formatFloat(ffDecimal, 1), " ms"
-    check elapsed < 2000.0
-
-  test "nimHandleRequest throughput (1000 requests)":
-    testLocConf = parseLocConf(
-      enabled = true,
-      appName = "hello",
-      hydrationEnabled = false,
-    )
-
-    let start = cpuTime()
-    for i in 0 ..< 1000:
-      resetMockState()
-      let req = newMockRequest(uri = "/hello", httpMethod = "GET")
-      let rc = nimHandleRequest(req)
-      check rc == NGX_OK
-    let elapsed = (cpuTime() - start) * 1000.0
-
-    echo "  1000 nimHandleRequest calls: ", elapsed.formatFloat(ffDecimal, 1), " ms"
     check elapsed < 2000.0

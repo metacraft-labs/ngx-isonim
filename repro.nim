@@ -81,7 +81,7 @@
 ##     the MOCK nginx bindings (no real nginx headers) and ``src/apps.nim``
 ##     compiles to nothing (its real ``import isonim/...`` block is
 ##     ``when not defined(isNginxTest)``), so these tests are a pure-Nim LEAF —
-##     they need neither the nginx dev headers nor the isonim sibling. Six
+##     they need neither the nginx dev headers nor the isonim sibling. Eight
 ##     files:
 ##       - ``test_adapter``            (``import ../src/nginx_adapter``)
 ##       - ``test_handler``            (``import ../src/handler`` + e2e/apps/hello)
@@ -89,6 +89,8 @@
 ##       - ``test_streaming_handler``  (``import ../src/{handler,nginx_adapter}``)
 ##       - ``test_e2e_integration``    (``import ../src/handler`` + 4 e2e apps)
 ##       - ``test_nginx_headers``      (``import ../src/nginx_http_adapter``)
+##       - ``test_request``            (``import ../src/{request,handler}``)
+##       - ``test_response``           (``import ../src/response``)
 ##     ``test_nginx_headers`` is not in a ``Justfile`` recipe but is a real
 ##     ``unittest`` suite that compiles + runs headless under ``-d:isNginxTest``
 ##     (it exercises the mock header-list adapter), so it gets a full edge.
@@ -105,17 +107,19 @@
 ##
 ## **Per-test platform gating.** Every test file is host-portable: none has
 ## an OS ``when defined(windows|macos|linux)`` extraction gate, and none is
-## host-exclusive. All eight tests compile + run to exit 0 under ``nim c`` on
+## host-exclusive. All ten tests compile + run to exit 0 under ``nim c`` on
 ## this Linux host — verified by a direct ``nim c`` sweep with the same paths +
 ## defines the edges below use. So there are no ``when defined(...)``
 ## extraction gates for the test set on this host.
 ##
-## **Not modelled.** ``tests/e2e/test_e2e.sh`` + the ``Justfile``
-## ``start-*`` / ``bench-*`` recipes drive a LIVE nginx server (build the
-## ``.so`` module, start nginx on a port, curl it / run ``wrk``). That is an
-## external-service integration path (a running nginx daemon), not a headless
-## ``unittest`` binary, so it is out of the sanctioned headless test scope and
-## gets no edge — the mock-mode + isonim-SSR ``unittest`` corpus above is the
+## **Not modelled.** ``tests/e2e/`` (``test_e2e.sh``,
+## ``test_request_context.nim``, ``test_csp_nonce.nim``,
+## ``test_max_buffer_size.nim``, ``test_streaming_debug.sh``; ``Justfile``
+## ``test-e2e``) and the ``start-*`` / ``bench-*`` recipes drive a LIVE nginx
+## server (build the ``.so`` module, start nginx on a port, curl it / run
+## ``wrk``). That is an external-service integration path (a running nginx
+## daemon), not a headless ``unittest`` binary, so it is out of the
+## sanctioned headless test scope and gets no edge — the mock-mode + isonim-SSR ``unittest`` corpus above is the
 ## complete set of files the repo compiles + runs with ``nim c -r``.
 ## The ``benchmarks/ssr_profile.nim`` profiler is likewise a benchmark driver,
 ## not a test, and is not modelled.
@@ -161,6 +165,8 @@ const mockTestSpecs: seq[NgxTestSpec] = @[
   spec("test_streaming_handler"),
   spec("test_e2e_integration"),
   spec("test_nginx_headers"),
+  spec("test_request"),
+  spec("test_response"),
 ]
 
 # IsoNim-SSR group — ``-d:isServer -d:asyncBackend=none`` + the SC-11 sibling

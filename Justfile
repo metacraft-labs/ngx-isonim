@@ -2,21 +2,17 @@
 
 # --- Build ---
 
-# Compile the nginx module .so (via Nix or direct nim c)
+# Compile the nginx module .so (release) into build/
 build:
-    nim c \
-      --mm:orc \
-      --noMain \
-      --app:lib \
-      -d:useFaststreams \
-      --passC:"-I$NGX_DEV_HEADERS/include/nginx/core" \
-      --passC:"-I$NGX_DEV_HEADERS/include/nginx/event" \
-      --passC:"-I$NGX_DEV_HEADERS/include/nginx/http" \
-      --passC:"-I$NGX_DEV_HEADERS/include/nginx/http/modules" \
-      --passC:"-I$NGX_DEV_HEADERS/include/nginx/os/unix" \
-      --passC:"-I$NGX_DEV_HEADERS/include/nginx/objs" \
-      -o:build/ngx_http_isonim_module.so \
-      src/handler.nim
+    scripts/build-module.sh release build/ngx_http_isonim_module.so
+
+# Compile the nginx module .so in debug mode (Nim checks, stack traces, -O0 -g)
+build-debug:
+    scripts/build-module.sh debug build/debug/ngx_http_isonim_module.so
+
+# Compile the module with the apps the end-to-end tests drive
+build-e2e:
+    scripts/build-module.sh release build/e2e/release/ngx_http_isonim_module.so -d:ngxIsonimTestApps
 
 # Build via Nix (produces result/lib/ngx_http_isonim_module.so)
 build-nix:
@@ -38,6 +34,9 @@ test:
     nim c -r -d:isNginxTest tests/test_handler.nim
     nim c -r -d:isNginxTest tests/test_config.nim
     nim c -r -d:isNginxTest tests/test_streaming_handler.nim
+    nim c -r -d:isNginxTest tests/test_request.nim
+    nim c -r -d:isNginxTest tests/test_response.nim
+    nim c -r -d:isNginxTest tests/test_nginx_headers.nim
     nim c -r tests/test_nimcache_is_worktree_local.nim
 
 # Run E2E integration tests (mock mode)
@@ -48,8 +47,21 @@ test-e2e-integration:
 test-isonim:
     nim c -r -d:isServer -d:asyncBackend=none --path:../isonim/src --path:../nim-everywhere/src --path:../nim-faststreams --path:../nim-stew tests/test_isonim_e2e.nim
 
+# Run the end-to-end tests: real nginx with the real module, driven by curl.
+# One release build with the e2e apps serves all but the debug-build test,
+# which builds its own debug module.
+test-e2e: build-e2e
+    #!/usr/bin/env bash
+    set -euo pipefail
+    export NGX_ISONIM_E2E_MODULE="$PWD/build/e2e/release/ngx_http_isonim_module.so"
+    bash tests/e2e/test_e2e.sh
+    for t in test_request_context test_csp_nonce test_max_buffer_size; do
+      nim c -r --hints:off -o:build/e2e/$t tests/e2e/$t.nim
+    done
+    bash tests/e2e/test_streaming_debug.sh
+
 # Run all tests
-test-all: test test-e2e-integration
+test-all: test test-e2e-integration test-isonim test-e2e
 
 # --- Server management ---
 
@@ -125,5 +137,6 @@ clean:
     rm -rf nimcache build benchmarks/ssr_profile
     rm -f tests/test_adapter tests/test_handler tests/test_config
     rm -f tests/test_streaming_handler tests/test_e2e_integration
-    rm -f tests/test_isonim_e2e
+    rm -f tests/test_isonim_e2e tests/test_request tests/test_response
+    rm -f tests/test_nginx_headers tests/test_nimcache_is_worktree_local
     rm -rf tests/nimcache benchmarks/nimcache

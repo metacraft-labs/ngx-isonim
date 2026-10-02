@@ -1,566 +1,372 @@
 ## test_handler.nim
 ##
-## Handler logic tests using mock nginx.
+## The request pipeline (serve.nim) the module runs for every request:
+## the app registry, method handling, response shaping on both transports,
+## the hydration script and its CSP nonce, isonim_ssr_max_buffer_size, and
+## what happens when a renderer or the client fails.
+##
+## Mocks: the pipeline runs over the recording sink of handler.nim
+## (`serveRecorded`), which stands in for nginx's header and output filters.
+## It is the only part replaced: the pipeline code is the one the module
+## runs.  The same behaviour is checked over real nginx by the tests under
+## tests/e2e/.
+##
 ## Compile with: nim c -r -d:isNginxTest tests/test_handler.nim
 
 import unittest
-import std/strutils
+import std/[strutils, sequtils, base64]
 import ../src/nginx_types
-import ../src/config
-import ../src/app_registry
 import ../src/handler
 import e2e/apps/hello
 
-# ---------------------------------------------------------------------------
-# App Registry tests
+proc getReq(path = "/", meth = "GET"; query = "";
+            headers: seq[(string, string)] = @[]): SsrRequest =
+  newSsrRequest(meth, path, (if query.len > 0: path & "?" & query else: path),
+                query, headers, "127.0.0.1")
+
+proc opts(mode = tmBuffered; hydration = false; maxBufferSize = 0;
+          appName = "app"): ServeOptions =
+  ServeOptions(appName: appName, hydration: hydration, mode: mode,
+               maxBufferSize: maxBufferSize)
+
+proc page(html: string): AppEntry =
+  stringApp(proc(req: SsrRequest; resp: SsrResponse): string = html)
+
+proc header(rec: RecordedResponse; name: string): seq[string] =
+  for (k, v) in rec.headers:
+    if cmpIgnoreCase(k, name) == 0:
+      result.add v
+
+proc nonceOf(body: string): string =
+  ## The nonce attribute of the hydration script.
+  let start = body.find("<script nonce=\"")
+  doAssert start >= 0, "no nonced script in: " & body
+  let s = start + "<script nonce=\"".len
+  body[s ..< body.find('"', s)]
+
+const bothModes = [tmBuffered, tmStreaming]
+
 # ---------------------------------------------------------------------------
 
 suite "App Registry":
   setup:
     clearApps()
 
-  test "register_and_lookup":
+  test "register_and_lookup_string_app":
+    registerApp("hello", proc(req: SsrRequest; resp: SsrResponse): string =
+      "hi " & req.path)
+    let app = lookupApp("hello")
+    check app != nil
+    check app.kind == akString
+    check app.render(getReq("/x"), newSsrResponse()) == "hi /x"
+
+  test "legacy_argumentless_renderer_is_adapted":
     registerApp("hello", helloApp)
-    let renderer = getApp("hello")
-    check renderer != nil
-    check renderer().contains("Hello from IsoNim")
+    let app = lookupApp("hello")
+    check app.kind == akString
+    check app.render(getReq(), newSsrResponse()).contains("Hello from IsoNim")
 
   test "lookup_nonexistent_returns_nil":
-    let renderer = getApp("does-not-exist")
-    check renderer == nil
+    check lookupApp("does-not-exist") == nil
 
   test "clear_removes_all_apps":
     registerApp("a", helloApp)
-    registerApp("b", taskManagerApp)
+    registerStreamingApp("b", helloStreamingApp)
     clearApps()
-    check getApp("a") == nil
-    check getApp("b") == nil
+    check lookupApp("a") == nil
+    check lookupApp("b") == nil
 
-  test "overwrite_existing_app":
+  test "one_namespace_last_registration_wins":
     registerApp("app", helloApp)
+    registerStreamingApp("app", helloStreamingApp)
+    check lookupApp("app").kind == akStreaming
     registerApp("app", taskManagerApp)
-    let renderer = getApp("app")
-    check renderer != nil
-    check renderer().contains("Task Manager")
+    check lookupApp("app").kind == akString
+    check lookupApp("app").render(getReq(), newSsrResponse()).contains("Task Manager")
 
-
-# ---------------------------------------------------------------------------
-# Handler - SSR Request (existing M2 tests, updated for M3)
-# ---------------------------------------------------------------------------
-
-suite "Handler - SSR Request":
-  test "valid_config_returns_200":
-    let conf = parseLocConf(
-      enabled = true,
-      appName = "test-app",
-      hydrationEnabled = false,
-    )
-    let reqInfo = RequestInfo(uri: "/", httpMethod: "GET", headers: @[])
-    let app: AppRenderer = proc(): string =
-      "<div><h1>Hello from IsoNim SSR</h1></div>"
-    let res = handleSsrRequest(conf, reqInfo, app)
-
-    check res.statusCode == 200
-    check res.body.contains("<div>")
-    check res.body.contains("<h1>Hello from IsoNim SSR</h1>")
-    check res.body.contains("</div>")
-
-  test "hydration_script_included_when_enabled":
-    let conf = parseLocConf(
-      enabled = true,
-      appName = "test-app",
-      hydrationEnabled = true,
-    )
-    let reqInfo = RequestInfo(uri: "/", httpMethod: "GET", headers: @[])
-    let app: AppRenderer = proc(): string =
-      "<div>content</div>"
-    let res = handleSsrRequest(conf, reqInfo, app)
-
-    check res.statusCode == 200
-    check res.body.contains("<script>")
-    check res.body.contains("window._$HY")
-
-  test "no_hydration_script_when_disabled":
-    let conf = parseLocConf(
-      enabled = true,
-      appName = "test-app",
-      hydrationEnabled = false,
-    )
-    let reqInfo = RequestInfo(uri: "/", httpMethod: "GET", headers: @[])
-    let app: AppRenderer = proc(): string =
-      "<div>content</div>"
-    let res = handleSsrRequest(conf, reqInfo, app)
-
-    check res.statusCode == 200
-    check not res.body.contains("window._$HY")
-
-  test "csp_nonce_included_in_script":
-    let conf = parseLocConf(
-      enabled = true,
-      appName = "test-app",
-      hydrationEnabled = true,
-      scriptNonce = "r4nd0m",
-    )
-    let reqInfo = RequestInfo(uri: "/", httpMethod: "GET", headers: @[])
-    let app: AppRenderer = proc(): string =
-      "<div>content</div>"
-    let res = handleSsrRequest(conf, reqInfo, app)
-
-    check res.statusCode == 200
-    check res.body.contains("nonce=\"r4nd0m\"")
-
-  test "invalid_config_returns_500":
-    let conf = parseLocConf(enabled = true, appName = "")
-    let reqInfo = RequestInfo(uri: "/", httpMethod: "GET", headers: @[])
-    let app: AppRenderer = proc(): string =
-      "should not render"
-    let res = handleSsrRequest(conf, reqInfo, app)
-
-    check res.statusCode == 500
-    check res.body.contains("invalid configuration")
-
-  test "render_error_returns_500":
-    let conf = parseLocConf(enabled = true, appName = "test-app")
-    let reqInfo = RequestInfo(uri: "/", httpMethod: "GET", headers: @[])
-    let app: AppRenderer = proc(): string =
-      raise newException(ValueError, "render failed")
-    let res = handleSsrRequest(conf, reqInfo, app)
-
-    check res.statusCode == 500
-    check res.body.contains("render error")
-
-  test "content_type_header_set":
-    let conf = parseLocConf(
-      enabled = true,
-      appName = "test-app",
-      hydrationEnabled = false,
-    )
-    let reqInfo = RequestInfo(uri: "/", httpMethod: "GET", headers: @[])
-    let app: AppRenderer = proc(): string =
-      "<div>content</div>"
-    let res = handleSsrRequest(conf, reqInfo, app)
-
-    var hasContentType = false
-    for (k, v) in res.headers:
-      if k == "Content-Type" and v == "text/html; charset=utf-8":
-        hasContentType = true
-    check hasContentType
-
-  test "content_length_header_matches_body":
-    let conf = parseLocConf(
-      enabled = true,
-      appName = "test-app",
-      hydrationEnabled = false,
-    )
-    let reqInfo = RequestInfo(uri: "/", httpMethod: "GET", headers: @[])
-    let app: AppRenderer = proc(): string =
-      "<div>content</div>"
-    let res = handleSsrRequest(conf, reqInfo, app)
-
-    var contentLength = ""
-    for (k, v) in res.headers:
-      if k == "Content-Length":
-        contentLength = v
-    check contentLength == $res.body.len
-
-  test "app_nil_returns_404":
-    let conf = parseLocConf(
-      enabled = true,
-      appName = "missing-app",
-    )
-    let reqInfo = RequestInfo(uri: "/", httpMethod: "GET", headers: @[])
-    let res = handleSsrRequest(conf, reqInfo, nil)
-
-    check res.statusCode == 404
-    check res.body.contains("app not found")
-
-  test "post_request_returns_405":
-    let conf = parseLocConf(
-      enabled = true,
-      appName = "test-app",
-    )
-    let reqInfo = RequestInfo(uri: "/", httpMethod: "POST", headers: @[])
-    let app: AppRenderer = proc(): string =
-      "should not render"
-    let res = handleSsrRequest(conf, reqInfo, app)
-
-    check res.statusCode == 405
-    check res.body.contains("Method Not Allowed")
-
-  test "put_request_returns_405":
-    let conf = parseLocConf(
-      enabled = true,
-      appName = "test-app",
-    )
-    let reqInfo = RequestInfo(uri: "/", httpMethod: "PUT", headers: @[])
-    let app: AppRenderer = proc(): string =
-      "should not render"
-    let res = handleSsrRequest(conf, reqInfo, app)
-
-    check res.statusCode == 405
-
-  test "head_request_returns_200_with_headers_no_body":
-    let conf = parseLocConf(
-      enabled = true,
-      appName = "test-app",
-      hydrationEnabled = false,
-    )
-    let reqInfo = RequestInfo(uri: "/", httpMethod: "HEAD", headers: @[])
-    let htmlContent = "<div>content</div>"
-    let app: AppRenderer = proc(): string =
-      htmlContent
-    let res = handleSsrRequest(conf, reqInfo, app)
-
-    check res.statusCode == 200
-    check res.body == ""  # HEAD: no body
-    check res.chunks.len == 0  # HEAD: no chunks
-    # Headers still set (including Content-Length for the full body)
-    var hasContentType = false
-    var contentLength = ""
-    for (k, v) in res.headers:
-      if k == "Content-Type":
-        hasContentType = true
-      if k == "Content-Length":
-        contentLength = v
-    check hasContentType
-    check contentLength == $htmlContent.len
-
-  test "head_request_with_hydration_content_length_includes_script":
-    let conf = parseLocConf(
-      enabled = true,
-      appName = "test-app",
-      hydrationEnabled = true,
-    )
-    let reqInfo = RequestInfo(uri: "/", httpMethod: "HEAD", headers: @[])
-    let app: AppRenderer = proc(): string =
-      "<div>content</div>"
-    let res = handleSsrRequest(conf, reqInfo, app)
-
-    check res.statusCode == 200
-    check res.body == ""
-    # Content-Length should account for the hydration script
-    var contentLength = 0
-    for (k, v) in res.headers:
-      if k == "Content-Length":
-        contentLength = parseInt(v)
-    check contentLength > "<div>content</div>".len  # script was included in length
-
+  test "nil_renderer_is_rejected":
+    expect ValueError:
+      registerApp("x", SsrRenderer(nil))
+    expect ValueError:
+      registerStreamingApp("x", SsrStreamingRenderer(nil))
 
 # ---------------------------------------------------------------------------
-# Handler - Streaming SSR
-# ---------------------------------------------------------------------------
 
-suite "Handler - Streaming SSR":
-  test "streaming_produces_chunks":
-    let conf = parseLocConf(
-      enabled = true,
-      appName = "stream-app",
-      hydrationEnabled = true,
-    )
-    let reqInfo = RequestInfo(uri: "/", httpMethod: "GET", headers: @[])
-    var receivedChunks: seq[string] = @[]
-    let res = handleStreamingSsrRequest(conf, reqInfo,
-      proc(): string =
-        "<html><body><h1>Streaming</h1></body></html>"
-      ,
-      proc(chunk: string) =
-        receivedChunks.add(chunk)
-    )
+suite "Pipeline - methods and app lookup":
+  test "only_GET_and_HEAD_are_served":
+    for m in ["POST", "PUT", "DELETE", "PATCH", "OPTIONS"]:
+      for mode in bothModes:
+        let rec = serveRecorded(getReq(meth = m), page("x"), opts(mode))
+        check rec.rc == NGX_HTTP_NOT_ALLOWED
+        check not rec.headersSent
 
-    check res.statusCode == 200
-    check receivedChunks.len >= 2  # HTML + hydration script
-    check res.body.contains("<html>")
-    check res.body.contains("window._$HY")
-
-  test "streaming_invalid_config":
-    let conf = parseLocConf(enabled = true, appName = "")
-    let reqInfo = RequestInfo(uri: "/", httpMethod: "GET", headers: @[])
-    let res = handleStreamingSsrRequest(conf, reqInfo,
-      proc(): string = "should not render",
-      proc(chunk: string) = discard,
-    )
-
-    check res.statusCode == 500
-
-  test "streaming_without_hydration":
-    let conf = parseLocConf(
-      enabled = true,
-      appName = "app",
-      hydrationEnabled = false,
-    )
-    let reqInfo = RequestInfo(uri: "/", httpMethod: "GET", headers: @[])
-    var receivedChunks: seq[string] = @[]
-    let res = handleStreamingSsrRequest(conf, reqInfo,
-      proc(): string = "<div>hello</div>",
-      proc(chunk: string) = receivedChunks.add(chunk),
-    )
-
-    check res.statusCode == 200
-    check receivedChunks.len == 1  # Just the HTML, no hydration script
-    check not res.body.contains("window._$HY")
-
-  test "streaming_nil_app_returns_404":
-    let conf = parseLocConf(
-      enabled = true,
-      appName = "missing",
-    )
-    let reqInfo = RequestInfo(uri: "/", httpMethod: "GET", headers: @[])
-    let res = handleStreamingSsrRequest(conf, reqInfo,
-      nil,
-      proc(chunk: string) = discard,
-    )
-
-    check res.statusCode == 404
-
-  test "streaming_post_returns_405":
-    let conf = parseLocConf(
-      enabled = true,
-      appName = "app",
-    )
-    let reqInfo = RequestInfo(uri: "/", httpMethod: "POST", headers: @[])
-    let res = handleStreamingSsrRequest(conf, reqInfo,
-      proc(): string = "nope",
-      proc(chunk: string) = discard,
-    )
-
-    check res.statusCode == 405
-
+  test "unknown_app_is_500_and_logged":
+    let rec = serveRecorded(getReq(), nil, opts(appName = "ghost"))
+    check rec.rc == NGX_HTTP_INTERNAL_SERVER_ERROR
+    check not rec.headersSent
+    check rec.log.len == 1
+    check rec.log[0][0] == NGX_LOG_ERR
+    check "ghost" in rec.log[0][1]
 
 # ---------------------------------------------------------------------------
-# Handler - Request Info
-# ---------------------------------------------------------------------------
 
-suite "Handler - Request Info":
-  test "request_info_constructable":
-    let reqInfo = RequestInfo(
-      uri: "/test",
-      httpMethod: "GET",
-      headers: @[("Accept", "text/html")],
-    )
-    check reqInfo.uri == "/test"
-    check reqInfo.httpMethod == "GET"
-    check reqInfo.headers.len == 1
+suite "Pipeline - buffered transport":
+  test "body_with_content_length_in_one_last_buffer":
+    let rec = serveRecorded(getReq(), page("<h1>Hi</h1>"), opts(tmBuffered))
+    check rec.rc == NGX_OK
+    check rec.status == 200
+    check rec.contentType == "text/html; charset=utf-8"
+    check rec.contentLength == "<h1>Hi</h1>".len
+    check rec.body == "<h1>Hi</h1>"
+    check rec.sends.len == 1
+    check rec.sends[0].last
 
-  test "handler_result_constructable":
-    let res = HandlerResult(
-      statusCode: 200,
-      headers: @[("Content-Type", "text/html")],
-      body: "<html></html>",
-      chunks: @["<html></html>"],
-    )
-    check res.statusCode == 200
-    check res.body == "<html></html>"
+  test "content_length_includes_the_hydration_script":
+    let rec = serveRecorded(getReq(), page("<p>x</p>"),
+                            opts(tmBuffered, hydration = true))
+    check rec.body.startsWith("<p>x</p><script nonce=")
+    check rec.body.endsWith("</script>")
+    check rec.contentLength == rec.body.len
 
+  test "streaming_renderer_on_buffered_transport_is_sent_whole":
+    let app = streamingApp(proc(req: SsrRequest; resp: SsrResponse;
+                                body: ResponseBody) =
+      body.write("<a>")
+      body.flush()
+      check not resp.committed   # buffered: flush sends nothing
+      body.write("<b>"))
+    let rec = serveRecorded(getReq(), app, opts(tmBuffered))
+    check rec.body == "<a><b>"
+    check rec.contentLength == 6
+    check rec.sends.len == 1
 
-# ---------------------------------------------------------------------------
-# Handler - Full nimHandleRequest flow (C->Nim bridge with app registry)
-# ---------------------------------------------------------------------------
-
-suite "Handler - nimHandleRequest with App Registry":
-  setup:
-    resetMockState()
-    clearApps()
-
-  test "registered_app_returns_NGX_OK_and_correct_body":
-    registerApp("hello", helloApp)
-    testLocConf = parseLocConf(
-      enabled = true,
-      appName = "hello",
-      hydrationEnabled = false,
-    )
-    let req = newMockRequest(uri = "/", httpMethod = "GET")
-    let rc = nimHandleRequest(req)
-    check rc == NGX_OK
-    check lastHandlerResult.statusCode == 200
-    check lastHandlerResult.body.contains("Hello from IsoNim")
-
-  test "registered_app_with_hydration":
-    registerApp("hello", helloApp)
-    testLocConf = parseLocConf(
-      enabled = true,
-      appName = "hello",
-      hydrationEnabled = true,
-    )
-    let req = newMockRequest(uri = "/", httpMethod = "GET")
-    let rc = nimHandleRequest(req)
-    check rc == NGX_OK
-    check lastHandlerResult.body.contains("window._$HY")
-
-  test "registered_app_without_hydration":
-    registerApp("hello", helloApp)
-    testLocConf = parseLocConf(
-      enabled = true,
-      appName = "hello",
-      hydrationEnabled = false,
-    )
-    let req = newMockRequest(uri = "/", httpMethod = "GET")
-    let rc = nimHandleRequest(req)
-    check rc == NGX_OK
-    check not lastHandlerResult.body.contains("window._$HY")
-
-  test "hydration_script_has_csp_nonce":
-    registerApp("hello", helloApp)
-    testLocConf = parseLocConf(
-      enabled = true,
-      appName = "hello",
-      hydrationEnabled = true,
-      scriptNonce = "abc123",
-    )
-    let req = newMockRequest(uri = "/", httpMethod = "GET")
-    let rc = nimHandleRequest(req)
-    check rc == NGX_OK
-    check lastHandlerResult.body.contains("nonce=\"abc123\"")
-
-  test "unregistered_app_returns_404":
-    testLocConf = parseLocConf(
-      enabled = true,
-      appName = "no-such-app",
-    )
-    let req = newMockRequest(uri = "/", httpMethod = "GET")
-    let rc = nimHandleRequest(req)
-    check rc == NGX_HTTP_NOT_FOUND
-
-  test "app_render_failure_returns_500":
-    registerApp("broken", proc(): string =
-      raise newException(ValueError, "render crashed")
-    )
-    testLocConf = parseLocConf(
-      enabled = true,
-      appName = "broken",
-    )
-    let req = newMockRequest(uri = "/", httpMethod = "GET")
-    let rc = nimHandleRequest(req)
-    check rc == NGX_HTTP_INTERNAL_SERVER_ERROR
-    check lastHandlerResult.body.contains("render error")
-
-  test "invalid_config_enabled_but_no_app_name_returns_500":
-    testLocConf = parseLocConf(enabled = true, appName = "")
-    let req = newMockRequest(uri = "/", httpMethod = "GET")
-    let rc = nimHandleRequest(req)
-    check rc == NGX_HTTP_INTERNAL_SERVER_ERROR
-    check lastHandlerResult.body.contains("invalid configuration")
-
-  test "head_request_returns_NGX_OK_no_body_written":
-    registerApp("hello", helloApp)
-    testLocConf = parseLocConf(
-      enabled = true,
-      appName = "hello",
-      hydrationEnabled = false,
-    )
-    let req = newMockRequest(uri = "/", httpMethod = "HEAD")
-    resetMockState()
-    let rc = nimHandleRequest(req)
-    check rc == NGX_OK
-    check lastHandlerResult.statusCode == 200
-    check lastHandlerResult.body == ""
-    # No body written, so no output filter calls from body writing
-    check mockOutputFilterCalls == 0
-
-  test "post_request_returns_405":
-    registerApp("hello", helloApp)
-    testLocConf = parseLocConf(
-      enabled = true,
-      appName = "hello",
-    )
-    let req = newMockRequest(uri = "/", httpMethod = "POST")
-    let rc = nimHandleRequest(req)
-    check rc == NGX_HTTP_NOT_ALLOWED
-
-  test "content_length_matches_body":
-    registerApp("hello", helloApp)
-    testLocConf = parseLocConf(
-      enabled = true,
-      appName = "hello",
-      hydrationEnabled = false,
-    )
-    let req = newMockRequest(uri = "/", httpMethod = "GET")
-    let rc = nimHandleRequest(req)
-    check rc == NGX_OK
-    var contentLength = ""
-    for (k, v) in lastHandlerResult.headers:
-      if k == "Content-Length":
-        contentLength = v
-    check contentLength == $lastHandlerResult.body.len
-
-  test "content_type_is_text_html_charset_utf8":
-    registerApp("hello", helloApp)
-    testLocConf = parseLocConf(
-      enabled = true,
-      appName = "hello",
-      hydrationEnabled = false,
-    )
-    let req = newMockRequest(uri = "/", httpMethod = "GET")
-    let rc = nimHandleRequest(req)
-    check rc == NGX_OK
-    var contentType = ""
-    for (k, v) in lastHandlerResult.headers:
-      if k == "Content-Type":
-        contentType = v
-    check contentType == "text/html; charset=utf-8"
-
-  test "output_stream_writes_body":
-    registerApp("hello", helloApp)
-    testLocConf = parseLocConf(
-      enabled = true,
-      appName = "hello",
-      hydrationEnabled = false,
-    )
-    let req = newMockRequest()
-    resetMockState()
-    let rc = nimHandleRequest(req)
-    check rc == NGX_OK
-    # The handler writes through the NginxOutputStream which calls
-    # ngx_http_output_filter.  Check that the mock recorded the calls.
-    check mockOutputFilterCalls >= 1  # flush + close
-
+  test "HEAD_sends_headers_with_the_GET_content_length_and_no_body":
+    let get = serveRecorded(getReq(), page("<h1>Hi</h1>"),
+                            opts(tmBuffered, hydration = true))
+    let head = serveRecorded(getReq(meth = "HEAD"), page("<h1>Hi</h1>"),
+                             opts(tmBuffered, hydration = true))
+    check head.rc == NGX_OK
+    check head.headersSent
+    check head.contentLength == get.contentLength
+    check head.body == ""
+    check head.sends.len == 0
 
 # ---------------------------------------------------------------------------
-# Multiple Apps
+
+suite "Pipeline - hydration script and CSP nonce":
+  test "script_present_only_when_enabled":
+    for mode in bothModes:
+      check "window._$HY" in serveRecorded(getReq(), page("x"),
+        opts(mode, hydration = true)).body
+      check "window._$HY" notin serveRecorded(getReq(), page("x"),
+        opts(mode, hydration = false)).body
+
+  test "script_nonce_is_128_random_bits_per_response":
+    var nonces: seq[string]
+    for i in 0 ..< 200:
+      let rec = serveRecorded(getReq(), page("x"),
+        opts(if i mod 2 == 0: tmBuffered else: tmStreaming, hydration = true))
+      let n = nonceOf(rec.body)
+      check base64.decode(n).len == 16
+      nonces.add n
+    check nonces.deduplicate.len == nonces.len
+
+  test "script_nonce_equals_the_nonce_the_renderer_put_in_its_header":
+    let app = stringApp(proc(req: SsrRequest; resp: SsrResponse): string =
+      resp.setHeader("Content-Security-Policy",
+                     "script-src " & resp.cspNonceSource)
+      "<p>csp</p>")
+    for mode in bothModes:
+      let rec = serveRecorded(getReq(), app, opts(mode, hydration = true))
+      check rec.header("Content-Security-Policy") ==
+        @["script-src 'nonce-" & nonceOf(rec.body) & "'"]
+
 # ---------------------------------------------------------------------------
 
-suite "Handler - Multiple Apps":
-  setup:
-    resetMockState()
-    clearApps()
+suite "Pipeline - response shaping":
+  test "renderer_that_sets_nothing_gets_200_and_the_default_type":
+    for mode in bothModes:
+      let rec = serveRecorded(getReq(), page("x"), opts(mode))
+      check rec.status == 200
+      check rec.contentType == "text/html; charset=utf-8"
+      check rec.headers.len == 0
 
-  test "two_apps_config_selects_correct_one":
-    registerApp("hello", helloApp)
-    registerApp("tasks", taskManagerApp)
+  test "status_headers_cookies_and_content_type_reach_the_sink":
+    let app = stringApp(proc(req: SsrRequest; resp: SsrResponse): string =
+      resp.status = 404
+      resp.contentType = "application/xhtml+xml"
+      resp.setHeader("Cache-Control", "private, no-cache, must-revalidate")
+      resp.addHeader("Vary", "Cookie")
+      resp.addHeader("Vary", "Accept-Language")
+      resp.setCookie("sid", "abc", CookieOptions(path: "/", httpOnly: true))
+      resp.setCookie("theme", "dark")
+      "<p>gone</p>")
+    for mode in bothModes:
+      let rec = serveRecorded(getReq(), app, opts(mode))
+      check rec.rc == NGX_OK
+      check rec.status == 404
+      check rec.contentType == "application/xhtml+xml"
+      check rec.header("Cache-Control") == @["private, no-cache, must-revalidate"]
+      check rec.header("Vary") == @["Cookie", "Accept-Language"]
+      check rec.header("Set-Cookie") == @["sid=abc; Path=/; HttpOnly", "theme=dark"]
+      check rec.body == "<p>gone</p>"
 
-    testLocConf = parseLocConf(
-      enabled = true,
-      appName = "hello",
-      hydrationEnabled = false,
-    )
-    let req = newMockRequest()
-    let rc = nimHandleRequest(req)
-    check rc == NGX_OK
-    check lastHandlerResult.body.contains("Hello from IsoNim")
-    check not lastHandlerResult.body.contains("Task Manager")
+  test "redirects_send_status_location_cookies_and_no_body":
+    for code in [301, 302, 303, 307, 308]:
+      for mode in bothModes:
+        let app = stringApp(proc(req: SsrRequest; resp: SsrResponse): string =
+          resp.setCookie("flash", "ok")
+          resp.redirect("/next", code)
+          "<p>this body is not sent</p>")
+        let rec = serveRecorded(getReq(), app, opts(mode, hydration = true))
+        check rec.rc == NGX_OK
+        check rec.status == code
+        check rec.header("Location") == @["/next"]
+        check rec.header("Set-Cookie") == @["flash=ok"]
+        check rec.contentLength == 0
+        check rec.body == ""
+        check rec.sends.len == 1 and rec.sends[0].last
 
-  test "change_config_app_name_renders_different_app":
-    registerApp("hello", helloApp)
-    registerApp("tasks", taskManagerApp)
+  test "writing_a_body_after_redirect_is_an_error":
+    let app = streamingApp(proc(req: SsrRequest; resp: SsrResponse;
+                                body: ResponseBody) =
+      resp.redirect("/x")
+      body.write("oops"))
+    let rec = serveRecorded(getReq(), app, opts(tmStreaming))
+    check rec.rc == NGX_HTTP_INTERNAL_SERVER_ERROR
+    check not rec.headersSent
+    check "redirect" in rec.log[0][1]
 
-    # First request: hello app
-    testLocConf = parseLocConf(
-      enabled = true,
-      appName = "hello",
-      hydrationEnabled = false,
-    )
-    var req = newMockRequest()
-    var rc = nimHandleRequest(req)
-    check rc == NGX_OK
-    check lastHandlerResult.body.contains("Hello from IsoNim")
+  test "204_and_304_go_out_without_a_body":
+    for code in [204, 304]:
+      for mode in bothModes:
+        let app = stringApp(proc(req: SsrRequest; resp: SsrResponse): string =
+          resp.status = code
+          "")
+        let rec = serveRecorded(getReq(), app, opts(mode, hydration = true))
+        check rec.rc == NGX_OK
+        check rec.status == code
+        check rec.sends.len == 0
 
-    # Second request: tasks app
-    testLocConf = parseLocConf(
-      enabled = true,
-      appName = "tasks",
-      hydrationEnabled = false,
-    )
-    req = newMockRequest()
-    rc = nimHandleRequest(req)
-    check rc == NGX_OK
-    check lastHandlerResult.body.contains("Task Manager")
-    check lastHandlerResult.body.contains("Task 1")
+  test "invalid_shaping_fails_the_request_before_anything_is_sent":
+    let app = stringApp(proc(req: SsrRequest; resp: SsrResponse): string =
+      resp.setHeader("X-Echo", req.queryParam("v"))
+      "x")
+    let rec = serveRecorded(getReq(query = "v=a%0D%0ASet-Cookie:+x=1"), app,
+                            opts(tmBuffered))
+    check rec.rc == NGX_HTTP_INTERNAL_SERVER_ERROR
+    check not rec.headersSent
+    check "ValueError" in rec.log[0][1]
+
+# ---------------------------------------------------------------------------
+
+suite "Pipeline - renderer failures":
+  test "raise_before_anything_is_sent_is_500_and_logged":
+    let app = stringApp(proc(req: SsrRequest; resp: SsrResponse): string =
+      resp.setHeader("X-Never", "sent")
+      raise newException(ValueError, "render failed"))
+    for mode in bothModes:
+      let rec = serveRecorded(getReq(), app, opts(mode))
+      check rec.rc == NGX_HTTP_INTERNAL_SERVER_ERROR
+      check not rec.headersSent
+      check rec.log.len == 1
+      check "render failed" in rec.log[0][1]
+      check "responding 500" in rec.log[0][1]
+
+  test "raise_after_the_first_flush_terminates_the_response":
+    let app = streamingApp(proc(req: SsrRequest; resp: SsrResponse;
+                                body: ResponseBody) =
+      body.write("<shell>")
+      body.flush()
+      raise newException(ValueError, "boundary failed"))
+    let rec = serveRecorded(getReq(), app, opts(tmStreaming, hydration = true))
+    check rec.rc == NGX_ERROR
+    check rec.headersSent
+    check rec.body == "<shell>"
+    check not rec.sends.anyIt(it.last)
+    check "boundary failed" in rec.log[0][1]
+    check "terminated" in rec.log[0][1]
+
+  test "shaping_after_commit_raises_and_terminates":
+    let app = streamingApp(proc(req: SsrRequest; resp: SsrResponse;
+                                body: ResponseBody) =
+      body.write("<shell>")
+      body.flush()
+      resp.setHeader("X-Late", "1"))
+    let rec = serveRecorded(getReq(), app, opts(tmStreaming))
+    check rec.rc == NGX_ERROR
+    check rec.header("X-Late").len == 0
+    check "ResponseCommittedError" in rec.log[0][1]
+
+  test "client_gone_mid_stream_stops_rendering":
+    var reachedAfter = false
+    let app = streamingApp(proc(req: SsrRequest; resp: SsrResponse;
+                                body: ResponseBody) =
+      body.write("<a>")
+      body.flush()
+      body.write("<b>")
+      body.flush()          # this send fails
+      reachedAfter = true)
+    let rec = serveRecorded(getReq(), app, opts(tmStreaming),
+                            RecordingOptions(failBodySendAt: 2))
+    check rec.rc == NGX_ERROR
+    check not reachedAfter
+    check rec.log[0][0] == NGX_LOG_INFO
+    check "client connection" in rec.log[0][1]
+
+# ---------------------------------------------------------------------------
+
+suite "Pipeline - isonim_ssr_max_buffer_size":
+  proc sized(n: int; flushEvery = 1024): AppEntry =
+    streamingApp(proc(req: SsrRequest; resp: SsrResponse; body: ResponseBody) =
+      var left = n
+      while left > 0:
+        let k = min(flushEvery, left)
+        body.write(repeat('x', k))
+        body.flush()
+        left -= k)
+
+  test "a_body_exactly_at_the_limit_is_served_whole":
+    for mode in bothModes:
+      let rec = serveRecorded(getReq(), sized(4096), opts(mode, maxBufferSize = 4096))
+      check rec.rc == NGX_OK
+      check rec.body.len == 4096
+      check rec.sends[^1].last
+
+  test "buffered_over_the_limit_is_500_with_nothing_sent":
+    for app in [sized(4097), page(repeat('y', 4097))]:
+      let rec = serveRecorded(getReq(), app, opts(tmBuffered, maxBufferSize = 4096))
+      check rec.rc == NGX_HTTP_INTERNAL_SERVER_ERROR
+      check not rec.headersSent
+      check rec.sends.len == 0
+      check "isonim_ssr_max_buffer_size" in rec.log[0][1]
+
+  test "streaming_over_the_limit_is_terminated_and_logged":
+    let rec = serveRecorded(getReq(), sized(4097), opts(tmStreaming, maxBufferSize = 4096))
+    check rec.rc == NGX_ERROR
+    check rec.headersSent
+    check rec.body.len == 4096          # the parts that fit were sent
+    check not rec.sends.anyIt(it.last)  # never completed
+    check rec.log[0][0] == NGX_LOG_ERR
+    check "isonim_ssr_max_buffer_size (4096 bytes)" in rec.log[0][1]
+    check "terminated" in rec.log[0][1]
+
+  test "streaming_over_the_limit_before_the_first_flush_is_500":
+    let rec = serveRecorded(getReq(), page(repeat('y', 5000)),
+                            opts(tmStreaming, maxBufferSize = 4096))
+    check rec.rc == NGX_HTTP_INTERNAL_SERVER_ERROR
+    check not rec.headersSent
+
+  test "the_hydration_script_counts_against_the_limit":
+    let body = repeat('z', 4000)
+    let ok = serveRecorded(getReq(), page(body),
+      opts(tmBuffered, hydration = true, maxBufferSize = 4000 + 200))
+    check ok.rc == NGX_OK
+    let tooBig = serveRecorded(getReq(), page(body),
+      opts(tmBuffered, hydration = true, maxBufferSize = 4000 + 20))
+    check tooBig.rc == NGX_HTTP_INTERNAL_SERVER_ERROR
+
+  test "zero_means_unlimited":
+    let rec = serveRecorded(getReq(), sized(300_000), opts(tmStreaming))
+    check rec.rc == NGX_OK
+    check rec.body.len == 300_000

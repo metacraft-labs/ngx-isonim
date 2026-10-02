@@ -1,4 +1,5 @@
 {
+  lib,
   stdenv,
   nim,
   nginxDevHeaders,
@@ -10,6 +11,10 @@
   stewPath,
   isOnimPath,
   nimEverywherePath,
+  # "release" (production) or "debug" (Nim checks and stack traces on).
+  buildMode ? "release",
+  # Compile in the apps the end-to-end tests drive (tests/e2e/apps).
+  withTestApps ? false,
 }:
 
 let
@@ -30,7 +35,8 @@ let
     if stdenv.isDarwin then "-Wl,-undefined,dynamic_lookup" else "";
 in
 stdenv.mkDerivation {
-  pname = "ngx-isonim-module";
+  pname = "ngx-isonim-module" + lib.optionalString (buildMode != "release") "-${buildMode}"
+    + lib.optionalString withTestApps "-e2e";
   version = "0.1.0";
   src = ./..;
 
@@ -43,68 +49,19 @@ stdenv.mkDerivation {
     libxcrypt
   ];
 
+  # scripts/build-module.sh holds the compile and link steps; the dev shell
+  # and the end-to-end tests run the same script.
+  NGX_DEV_HEADERS = "${nginxDevHeaders}";
+  NGX_ISONIM_PATHS = "${faststreamsPath}:${stewPath}:${isOnimPath}:${nimEverywherePath}";
+  NGX_ISONIM_NIMCACHE = "nimcache";
+  # See `undefinedDynamicLookup` above.  Empty on Linux.
+  NGX_ISONIM_EXTRA_LDFLAGS = undefinedDynamicLookup;
+
   buildPhase = ''
-    # Build -I flags for all nginx header subdirectories.
-    # nginx headers are scattered across src/{core,event,http,os}/... with
-    # nested subdirs (event/quic, http/v2, http/v3, etc.). Rather than
-    # hard-coding each, find all directories containing .h files.
-    NGX_INCLUDES=""
-    for dir in $(find ${nginxDevHeaders}/include/nginx -type f -name '*.h' -printf '%h\n' | sort -u); do
-      NGX_INCLUDES="$NGX_INCLUDES -I$dir"
-    done
-
-    # See `undefinedDynamicLookup` above.  Both are EMPTY on Linux, and an
-    # unquoted empty expansion contributes no argument at all, so the Linux
-    # command lines are byte-identical to before.
-    NGX_UNDEF_LD="${undefinedDynamicLookup}"
-    NGX_UNDEF_PASSL=${
-      if undefinedDynamicLookup == "" then
-        "\"\""
-      else
-        "--passL:${undefinedDynamicLookup}"
-    }
-
-    # Build Nim --passC flags from the include dirs
-    NGX_NIM_PASSC=""
-    for dir in $(find ${nginxDevHeaders}/include/nginx -type f -name '*.h' -printf '%h\n' | sort -u); do
-      NGX_NIM_PASSC="$NGX_NIM_PASSC --passC:-I$dir"
-    done
-
-    # 1. Compile Nim handler to C
-    #    --path flags provide nim-faststreams, nim-stew, isonim, and nim-everywhere.
-    #    --noMain + --app:lib: no main(), produce a shared library.
-    #    --mm:orc: deterministic GC for long-lived nginx workers.
-    #    -d:isServer: enables SSR mode in isonim (buildHtmlString path).
-    nim c \
-      --mm:orc \
-      --noMain \
-      --app:lib \
-      -d:release \
-      -d:danger \
-      --opt:speed \
-      --nimcache:nimcache \
-      -d:asyncBackend=nginx \
-      -d:isServer \
-      --path:"${faststreamsPath}" \
-      --path:"${stewPath}" \
-      --path:"${isOnimPath}" \
-      --path:"${nimEverywherePath}" \
-      --passC:"-fPIC" \
-      $NGX_UNDEF_PASSL \
-      $NGX_NIM_PASSC \
-      src/handler.nim
-
-    # 2. Compile the C module registration file
-    cc -c -fPIC -O2 \
-      $NGX_INCLUDES \
-      -o ngx_http_isonim_module.o \
-      src/ngx_http_isonim_module.c
-
-    # 3. Link into shared library with LTO
-    cc -shared -O2 $NGX_UNDEF_LD -o ngx_http_isonim_module.so \
-      ngx_http_isonim_module.o \
-      nimcache/*.o \
-      -lpcre2-8 -lssl -lcrypto -lz
+    patchShebangs scripts/build-module.sh
+    export HOME=$TMPDIR
+    scripts/build-module.sh ${buildMode} ngx_http_isonim_module.so \
+      ${lib.optionalString withTestApps "-d:ngxIsonimTestApps"}
   '';
 
   installPhase = ''

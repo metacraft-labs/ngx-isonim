@@ -91,15 +91,16 @@ proc findHeader*(part: NgxListPart, name: string): NgxStr =
   else:
     return NgxStr(data: nil, len: 0)
 
-proc buildMockHeaderList*(headers: var seq[(string, string)]): MockListPart =
-  ## Build a mock nginx header list. The headers seq must stay alive
-  ## for the lifetime of the returned list (openArray-like borrowing).
-  var part = MockListPart(elts: @[], next: nil)
-  for i in 0 ..< headers.len:
-    var elt = MockTableElt()
-    if headers[i][0].len > 0:
-      elt.key = MockNgxStr(data: cast[ptr byte](addr headers[i][0][0]), len: headers[i][0].len)
-    if headers[i][1].len > 0:
-      elt.value = MockNgxStr(data: cast[ptr byte](addr headers[i][1][0]), len: headers[i][1].len)
-    part.elts.add(elt)
-  return part
+when defined(isNginxTest):
+  proc buildMockHeaderList*(headers: var seq[(string, string)]): MockListPart =
+    ## Build a mock nginx header list. The headers seq must stay alive
+    ## for the lifetime of the returned list (openArray-like borrowing).
+    var part = MockListPart(elts: @[], next: nil)
+    for i in 0 ..< headers.len:
+      var elt = MockTableElt()
+      if headers[i][0].len > 0:
+        elt.key = MockNgxStr(data: cast[ptr byte](addr headers[i][0][0]), len: headers[i][0].len)
+      if headers[i][1].len > 0:
+        elt.value = MockNgxStr(data: cast[ptr byte](addr headers[i][1][0]), len: headers[i][1].len)
+      part.elts.add(elt)
+    return part

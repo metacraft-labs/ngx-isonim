@@ -1,26 +1,26 @@
 ## apps.nim
 ##
-## Default app registration for the production nginx module.
-## Imports the real IsoNim SSR renderer and registers apps that
-## use the reactive core, DSL, and server-side rendering pipeline.
+## The apps compiled into the production module.  `registerDefaultApps`
+## runs once per worker, from `nim_module_init`.
 ##
-## This module is only compiled in production mode (not isNginxTest).
-## The test mode uses mock apps registered directly in test files.
+## Built with `-d:ngxIsonimTestApps`, the module also registers the apps the
+## end-to-end tests drive (tests/e2e/apps/e2e_apps.nim).
+##
+## Not compiled in mock mode (`-d:isNginxTest`): the unit tests register
+## their own apps.
 
 when not defined(isNginxTest):
   import app_registry
 
   # IsoNim reactive core and SSR
-  import isonim/core/owner
   import isonim/core/signals
   import isonim/core/computation
   import isonim/ssr/renderer
-  import isonim/ssr/markers
   import isonim/ssr/escape
   import isonim/dsl/ui
 
-  when defined(useFaststreams):
-    import faststreams/outputs as fsOutputs
+  when defined(ngxIsonimTestApps):
+    import ../tests/e2e/apps/e2e_apps
 
   type
     Task = object
@@ -76,18 +76,8 @@ when not defined(isNginxTest):
       Task(id: 5, text: "Celebrate!", done: false),
     ]
 
-  when defined(useFaststreams):
-    proc renderAppToStream*(output: fsOutputs.OutputStream; appName: string;
-                            hydration: bool; nonce: string) =
-      ## Renders a registered app directly to a faststreams OutputStream.
-      ## Used by the streaming nginx handler to avoid intermediate string copies.
-      let app = getApp(appName)
-      if app != nil:
-        renderToOutputStream(output, app, hydration = hydration, nonce = nonce)
-
   proc registerDefaultApps*() =
-    ## Registers the default set of apps for the nginx module.
-    ## Called once during module initialization.
+    ## Registers the apps of the production module.
 
     # Simple hello app (no IsoNim dependency)
     registerApp("hello", proc(): string =
@@ -95,8 +85,9 @@ when not defined(isNginxTest):
     )
 
     # Real IsoNim SSR task manager app — renders on every request.
-    # In production, the app would receive per-request data (query params,
-    # session state, database results) and render dynamically.
     registerApp("tasks", proc(): string =
       renderTaskApp(defaultTasks())
     )
+
+    when defined(ngxIsonimTestApps):
+      registerE2eApps()

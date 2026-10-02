@@ -69,8 +69,7 @@
         isOnimPath = "${isonim}/src";
         nimEverywherePath = "${nim-everywhere}/src";
 
-        # The .so module derivation.
-        ngxIsOnimModule = pkgs.callPackage ./nix/ngx-isonim-module.nix {
+        moduleArgs = {
           inherit
             nginxDevHeaders
             faststreamsPath
@@ -79,6 +78,18 @@
             nimEverywherePath
             ;
         };
+
+        # The .so module derivation (release, the production build).
+        ngxIsOnimModule = pkgs.callPackage ./nix/ngx-isonim-module.nix moduleArgs;
+
+        # The same module built in debug mode, and with the apps the
+        # end-to-end tests drive (tests/e2e/apps/e2e_apps.nim).
+        ngxIsOnimModuleDebug = pkgs.callPackage ./nix/ngx-isonim-module.nix (
+          moduleArgs // { buildMode = "debug"; }
+        );
+        ngxIsOnimModuleE2e = pkgs.callPackage ./nix/ngx-isonim-module.nix (
+          moduleArgs // { withTestApps = true; }
+        );
 
         # Pure C baseline module for performance comparison.
         baselineModule = pkgs.callPackage ./nix/baseline-module.nix {
@@ -137,6 +148,15 @@
             pkgs.wrk
             pkgs.jq
             nginxCompat
+            # Headers and libraries the module links against: the
+            # configured nginx headers include <crypt.h>, <pcre2.h>,
+            # <openssl/*.h> and <zlib.h>.  scripts/build-module.sh needs
+            # them to build the module outside Nix (the debug build of
+            # tests/e2e/test_streaming_debug.sh).
+            pkgs.pcre2
+            pkgs.openssl
+            pkgs.zlib
+            pkgs.libxcrypt
           ]
           ++ pkgs.lib.optionals isLinux [
             pkgs.strace
@@ -163,6 +183,8 @@
 
         packages = {
           module = ngxIsOnimModule;
+          module-debug = ngxIsOnimModuleDebug;
+          module-e2e = ngxIsOnimModuleE2e;
           baseline = baselineModule;
           nginx-with-isonim = nginxWithIsonim;
           nginx-baseline = nginxBaseline;
@@ -172,8 +194,9 @@
         apps.test-e2e = {
           type = "app";
           program = "${pkgs.writeShellScript "test-e2e" ''
-            export PATH="${nginxWithIsonim}/bin:${pkgs.curl}/bin:$PATH"
-            exec ${./tests/e2e/test_e2e.sh} "$@"
+            export PATH="${nginxCompat}/bin:${pkgs.curl}/bin:${pkgs.wrk}/bin:$PATH"
+            export NGX_ISONIM_E2E_MODULE=${ngxIsOnimModuleE2e}/lib/ngx_http_isonim_module.so
+            exec ${pkgs.bash}/bin/bash ${./tests/e2e}/test_e2e.sh "$@"
           ''}";
         };
       }

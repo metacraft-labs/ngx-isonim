@@ -9,8 +9,10 @@ when not defined(isNginxTest):
   # Real nginx bindings — requires nginx dev headers at compile time.
 
   type
-    NgxInt* = cint
-    NgxUint* = cuint
+    NgxInt* = int
+      ## ngx_int_t (intptr_t): pointer-sized, so -1 stays -1 across the
+      ## C boundary.
+    NgxUint* = uint
 
     NgxPoolObj {.importc: "ngx_pool_t", header: "<ngx_core.h>", incompleteStruct.} = object
     NgxPool* = ptr NgxPoolObj
@@ -72,12 +74,34 @@ when not defined(isNginxTest):
   proc ngx_http_send_header*(r: NgxHttpRequest): NgxInt
     {.importc: "ngx_http_send_header", header: "<ngx_http.h>".}
 
+  # Helpers defined in ngx_http_isonim_module.c (see the comments there).
+  type
+    NgxIsonimHeader* {.bycopy.} = object
+      ## ngx_http_isonim_header_t
+      key*: ptr char
+      keyLen*: csize_t
+      value*: ptr char
+      valueLen*: csize_t
+
+  proc ngx_http_isonim_send_header*(r: NgxHttpRequest; status: NgxUint;
+      contentType: ptr char; contentTypeLen: csize_t; contentLength: int64;
+      headers: ptr NgxIsonimHeader; nheaders: NgxUint): NgxInt
+    {.importc: "ngx_http_isonim_send_header", cdecl.}
+
+  proc ngx_http_isonim_send_body*(r: NgxHttpRequest; data: ptr char;
+      len: csize_t; flush, last: NgxInt): NgxInt
+    {.importc: "ngx_http_isonim_send_body", cdecl.}
+
+  proc ngx_http_isonim_log*(r: NgxHttpRequest; level: NgxUint;
+      msg: ptr char; len: csize_t)
+    {.importc: "ngx_http_isonim_log", cdecl.}
+
 else:
   # Mock implementations for testing.
 
   type
-    NgxInt* = cint
-    NgxUint* = cuint
+    NgxInt* = int
+    NgxUint* = uint
 
     MockBuf* = ref object
       ## Mock buffer representing an ngx_buf_t.
@@ -124,6 +148,12 @@ else:
       httpMethod*: string
       headers*: seq[(string, string)]
       headerParts*: MockListPart
+      args*: string
+        ## r->args: the raw query string.
+      unparsedUri*: string
+        ## r->unparsed_uri; when empty, uri plus "?" plus args is used.
+      addrText*: string
+        ## r->connection->addr_text.
 
     # Type aliases matching the real API names.
     NgxPool* = MockPool
@@ -143,6 +173,7 @@ else:
       uri: uri,
       httpMethod: httpMethod,
       headers: @[],
+      addrText: "127.0.0.1",
     )
 
   proc ngx_palloc*(pool: MockPool; size: csize_t): pointer =
@@ -222,7 +253,14 @@ const
   ## nginx return codes.
   NGX_OK*: NgxInt = 0
   NGX_ERROR*: NgxInt = -1
+  NGX_AGAIN*: NgxInt = -2
+  NGX_DONE*: NgxInt = -4
   NGX_DECLINED*: NgxInt = -5
+
+  ## Error log levels (ngx_log.h).
+  NGX_LOG_ERR*: NgxUint = 4
+  NGX_LOG_WARN*: NgxUint = 5
+  NGX_LOG_INFO*: NgxUint = 7
 
   ## HTTP status codes.
   NGX_HTTP_OK*: NgxInt = 200
