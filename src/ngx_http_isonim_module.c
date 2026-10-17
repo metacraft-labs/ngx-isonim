@@ -23,7 +23,12 @@
  *     (status and headers, body buffers, finalization, error log lines).
  *     They live here because they touch nginx structures (headers_out,
  *     ngx_buf_t bitfields, the connection log) that are clearer to
- *     manipulate from C.
+ *     manipulate from C;
+ *   - application shared-memory zones (the isonim_shm_zone directive, in
+ *     the http block): each an nginx shared-memory zone with a slab pool,
+ *     the reload rule that decides whether a new configuration's zone keeps
+ *     the old contents, and the helpers shm_table.nim's operations call
+ *     (the zone lookup, the pool's mutex, the slab allocator).
  *
  * Request handling itself (method check, app lookup, rendering, response
  * shaping, the hydration script and its per-response CSP nonce, the
@@ -36,6 +41,8 @@
 #include <ngx_config.h>
 #include <ngx_core.h>
 #include <ngx_http.h>
+
+#include "ngx_http_isonim_shm.h"
 
 /* ------------------------------------------------------------------ */
 /* The request view handed to Nim.                                    */
@@ -123,13 +130,40 @@ typedef struct {
     ngx_msec_t  rpc_timeout;        /* 0 = none                            */
 } ngx_http_isonim_loc_conf_t;
 
+/* ------------------------------------------------------------------ */
+/* Main (http) configuration: the application shared-memory zones.     */
+/* ------------------------------------------------------------------ */
+
+/* One isonim_shm_zone.  Allocated on its own (the zones array holds
+ * pointers), because the shm zone's `data` points at it. */
+typedef struct {
+    ngx_str_t        name;
+    size_t           size;
+    size_t           max_value;
+    ngx_shm_zone_t  *shm_zone;
+} ngx_http_isonim_shm_conf_t;
+
+typedef struct {
+    ngx_array_t      zones;      /* of ngx_http_isonim_shm_conf_t *        */
+} ngx_http_isonim_main_conf_t;
+
+/* spec/isonim-nginx.md, "Shared-Memory Zones for Applications". */
+#define NGX_HTTP_ISONIM_SHM_NAME_MAX       64
+#define NGX_HTTP_ISONIM_SHM_MIN_SIZE       (64 * 1024)
+#define NGX_HTTP_ISONIM_SHM_MAX_SIZE       ((off_t) 4 * 1024 * 1024 * 1024)
+#define NGX_HTTP_ISONIM_SHM_DEFAULT_VALUE  4096
+
 /* Forward declarations */
+static void      *ngx_http_isonim_create_main_conf(ngx_conf_t *cf);
+static char      *ngx_http_isonim_shm_zone(ngx_conf_t *cf,
+                      ngx_command_t *cmd, void *conf);
 static void      *ngx_http_isonim_create_loc_conf(ngx_conf_t *cf);
 static char      *ngx_http_isonim_merge_loc_conf(ngx_conf_t *cf,
                       void *parent, void *child);
 static ngx_int_t  ngx_http_isonim_postconfiguration(ngx_conf_t *cf);
 static ngx_int_t  ngx_http_isonim_handler(ngx_http_request_t *r);
 static void       ngx_http_isonim_exit_process(ngx_cycle_t *cycle);
+static ngx_int_t  ngx_http_isonim_init_module(ngx_cycle_t *cycle);
 
 /* ------------------------------------------------------------------ */
 /* Directives                                                         */
@@ -217,6 +251,15 @@ static ngx_command_t ngx_http_isonim_commands[] = {
       offsetof(ngx_http_isonim_loc_conf_t, rpc_timeout),
       NULL },
 
+    /* isonim_shm_zone <name> size=<size> [max_value=<size>]: a
+     * shared-memory zone an application binds by name (shmTable). */
+    { ngx_string("isonim_shm_zone"),
+      NGX_HTTP_MAIN_CONF | NGX_CONF_TAKE23,
+      ngx_http_isonim_shm_zone,
+      NGX_HTTP_MAIN_CONF_OFFSET,
+      0,
+      NULL },
+
     ngx_null_command
 };
 
@@ -227,7 +270,8 @@ static ngx_command_t ngx_http_isonim_commands[] = {
 static ngx_http_module_t ngx_http_isonim_module_ctx = {
     NULL,
     ngx_http_isonim_postconfiguration,
-    NULL, NULL, NULL, NULL,
+    ngx_http_isonim_create_main_conf,
+    NULL, NULL, NULL,
     ngx_http_isonim_create_loc_conf,
     ngx_http_isonim_merge_loc_conf
 };
@@ -238,7 +282,7 @@ ngx_module_t ngx_http_isonim_module = {
     ngx_http_isonim_commands,
     NGX_HTTP_MODULE,
     NULL,                                  /* init master    */
-    NULL,                                  /* init module    */
+    ngx_http_isonim_init_module,           /* init module    */
     NULL,                                  /* init process   */
     NULL,                                  /* init thread    */
     NULL,                                  /* exit thread    */
@@ -793,6 +837,451 @@ ngx_http_isonim_exit_process(ngx_cycle_t *cycle)
     if (ngx_http_isonim_pump_timer.timer_set) {
         ngx_del_timer(&ngx_http_isonim_pump_timer);
     }
+}
+
+/* ------------------------------------------------------------------ */
+/* Application shared-memory zones (isonim_shm_zone)                  */
+/*                                                                    */
+/* nginx creates shared memory only while it reads its configuration, */
+/* before any worker exists, so a zone is declared in the http block  */
+/* and an application binds it by name in a worker (shm_table.nim).   */
+/* The zone's slab pool is set up by nginx (ngx_init_zone_pool); the  */
+/* table's header is set up by the first worker that binds the zone,  */
+/* under the pool's mutex, so the master never runs Nim code.         */
+/* ------------------------------------------------------------------ */
+
+static void *
+ngx_http_isonim_create_main_conf(ngx_conf_t *cf)
+{
+    ngx_http_isonim_main_conf_t  *imcf;
+
+    imcf = ngx_pcalloc(cf->pool, sizeof(ngx_http_isonim_main_conf_t));
+    if (imcf == NULL) {
+        return NULL;
+    }
+    if (ngx_array_init(&imcf->zones, cf->pool, 4,
+                       sizeof(ngx_http_isonim_shm_conf_t *))
+        != NGX_OK)
+    {
+        return NULL;
+    }
+    return imcf;
+}
+
+/* The zone's init callback, run by nginx in the master for every new
+ * cycle.  `data` is the previous configuration's zone when there was one
+ * of the same name; nginx has then either handed this zone the old
+ * segment (same name, size and module, and the reload check below did not
+ * set noreuse) or a fresh, zero-filled one.  Either way the slab pool is
+ * ready; the table's header (pool->data) is the first binding worker's
+ * to create, or survives from the old segment. */
+static ngx_int_t
+ngx_http_isonim_shm_init(ngx_shm_zone_t *shm_zone, void *data)
+{
+    ngx_http_isonim_shm_conf_t  *zc = shm_zone->data;
+    ngx_slab_pool_t             *sp;
+    size_t                       len;
+
+    sp = (ngx_slab_pool_t *) shm_zone->shm.addr;
+
+    /* A store that finds no room evicts and retries (shm_table.nim); the
+     * slab allocator must not log every failed attempt. */
+    sp->log_nomem = 0;
+
+    if (sp->log_ctx == NULL) {
+        /* A fresh segment: name the zone in the slab allocator's own
+         * messages, as nginx's modules do. */
+        len = sizeof(" in isonim_shm_zone \"\"") + zc->name.len;
+        sp->log_ctx = ngx_slab_alloc(sp, len);
+        if (sp->log_ctx == NULL) {
+            return NGX_ERROR;
+        }
+        ngx_sprintf(sp->log_ctx, " in isonim_shm_zone \"%V\"%Z", &zc->name);
+    }
+    return NGX_OK;
+}
+
+/* Reload rule (spec/isonim-nginx.md, "Reload").  nginx itself hands a new
+ * configuration's zone the old segment when the name, the size and the
+ * owning module are unchanged.  The table may keep its contents only when
+ * its max_value and the module's zone layout are unchanged too: otherwise
+ * the new zone is marked noreuse, so the new workers get a fresh segment
+ * (the old workers keep theirs until they exit).  The old zone is marked
+ * too, so that the master unmaps it instead of keeping it alive for
+ * nothing, but only in init_module (ngx_http_isonim_init_module), once the
+ * new cycle has been set up: this configuration may still fail, and a mark
+ * on the old cycle's zone survives a failed reload, so the next reload
+ * that reuses the segment would have the master unmap it from under its
+ * new workers.
+ *
+ * Runs in the master while it reads the new configuration; the old
+ * segment is mapped there at the same address.  Its header's magic,
+ * layout and max_value are written once, before pool->data is set
+ * (shm_table.nim), so reading them without the lock is safe. */
+static void
+ngx_http_isonim_shm_check_reuse(ngx_conf_t *cf, ngx_http_isonim_shm_conf_t *zc,
+    ngx_shm_zone_t *shm_zone)
+{
+    ngx_uint_t                     i;
+    ngx_cycle_t                   *old_cycle;
+    ngx_list_part_t               *part;
+    ngx_shm_zone_t                *oshm;
+    ngx_slab_pool_t               *sp;
+    ngx_http_isonim_shm_header_t  *hdr;
+
+    old_cycle = cf->cycle->old_cycle;
+    if (old_cycle == NULL || old_cycle->shared_memory.part.elts == NULL) {
+        return;          /* the first start, or nginx -t */
+    }
+
+    part = &old_cycle->shared_memory.part;
+    oshm = part->elts;
+
+    for (i = 0; /* void */ ; i++) {
+
+        if (i >= part->nelts) {
+            if (part->next == NULL) {
+                return;
+            }
+            part = part->next;
+            oshm = part->elts;
+            i = 0;
+        }
+
+        if (oshm[i].tag != &ngx_http_isonim_module
+            || oshm[i].shm.name.len != zc->name.len
+            || ngx_strncmp(oshm[i].shm.name.data, zc->name.data,
+                           zc->name.len) != 0)
+        {
+            continue;
+        }
+
+        if (oshm[i].shm.size != zc->size || oshm[i].shm.addr == NULL) {
+            return;      /* nginx gives the new zone a fresh segment */
+        }
+
+        sp = (ngx_slab_pool_t *) oshm[i].shm.addr;
+        hdr = sp->data;
+        if (hdr == NULL) {
+            return;      /* never bound: an empty table either way */
+        }
+
+        if (hdr->magic != NGX_HTTP_ISONIM_SHM_MAGIC
+            || hdr->layout != NGX_HTTP_ISONIM_SHM_LAYOUT
+            || hdr->max_value != (uint64_t) zc->max_value)
+        {
+            ngx_conf_log_error(NGX_LOG_NOTICE, cf, 0,
+                "isonim_shm_zone \"%V\" starts empty: its max_value or the "
+                "module's zone layout changed", &zc->name);
+            /* Never the old zone here: see above and init_module. */
+            shm_zone->noreuse = 1;
+        }
+        return;
+    }
+}
+
+/* Marks the old cycle's zone of the same name as `shm_zone` noreuse, so
+ * that the master unmaps it (ngx_init_cycle frees an old zone marked
+ * noreuse).  For init_module, below. */
+static void
+ngx_http_isonim_shm_release_old(ngx_cycle_t *old_cycle,
+    ngx_shm_zone_t *shm_zone)
+{
+    ngx_uint_t        i;
+    ngx_list_part_t  *part;
+    ngx_shm_zone_t   *oshm;
+
+    if (old_cycle == NULL || old_cycle->shared_memory.part.elts == NULL) {
+        return;
+    }
+
+    part = &old_cycle->shared_memory.part;
+    oshm = part->elts;
+
+    for (i = 0; /* void */ ; i++) {
+
+        if (i >= part->nelts) {
+            if (part->next == NULL) {
+                return;
+            }
+            part = part->next;
+            oshm = part->elts;
+            i = 0;
+        }
+
+        if (oshm[i].tag == &ngx_http_isonim_module
+            && oshm[i].shm.name.len == shm_zone->shm.name.len
+            && ngx_strncmp(oshm[i].shm.name.data, shm_zone->shm.name.data,
+                           shm_zone->shm.name.len) == 0)
+        {
+            oshm[i].noreuse = 1;
+            return;
+        }
+    }
+}
+
+/* init_module: runs in the master once the new cycle's shared memory is
+ * set up and its listening sockets are open, just before nginx frees the
+ * old cycle's segments that the new one does not reuse.  It runs only when
+ * the new configuration has been accepted: a reload that fails earlier
+ * (ngx_init_cycle's `failed:` path) never reaches it.
+ *
+ * For each new zone that the reload check marked noreuse (so that nginx
+ * gave it a fresh segment):
+ *
+ *   - the old cycle's zone of that name is marked noreuse now, so that the
+ *     master unmaps the segment the new zone does not use.  Marking it
+ *     while the configuration is read instead would let a reload that
+ *     then fails leave the mark on the running cycle's zone, and the next
+ *     reload, reusing that segment, would have the master unmap it from
+ *     under its new workers;
+ *   - the new zone's own mark is cleared: at the next reload this cycle is
+ *     the old one, and nginx frees an old zone marked noreuse even when the
+ *     new configuration reuses it.  (Clearing it in the zone's init
+ *     callback instead would keep a failed reload from freeing the fresh
+ *     segment.) */
+static ngx_int_t
+ngx_http_isonim_init_module(ngx_cycle_t *cycle)
+{
+    ngx_uint_t        i;
+    ngx_list_part_t  *part;
+    ngx_shm_zone_t   *shm_zone;
+
+    part = &cycle->shared_memory.part;
+    shm_zone = part->elts;
+
+    for (i = 0; /* void */ ; i++) {
+
+        if (i >= part->nelts) {
+            if (part->next == NULL) {
+                break;
+            }
+            part = part->next;
+            shm_zone = part->elts;
+            i = 0;
+        }
+
+        if (shm_zone[i].tag == &ngx_http_isonim_module
+            && shm_zone[i].noreuse)
+        {
+            ngx_http_isonim_shm_release_old(cycle->old_cycle, &shm_zone[i]);
+            shm_zone[i].noreuse = 0;
+        }
+    }
+    return NGX_OK;
+}
+
+/* Parses one size= or max_value= value: nginx sizes with k, m or g. */
+static off_t
+ngx_http_isonim_shm_parse_size(u_char *p, size_t len)
+{
+    ngx_str_t  s;
+
+    s.data = p;
+    s.len = len;
+    return ngx_parse_offset(&s);
+}
+
+/* isonim_shm_zone <name> size=<size> [max_value=<size>] */
+static char *
+ngx_http_isonim_shm_zone(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
+{
+    ngx_http_isonim_main_conf_t   *imcf = conf;
+    ngx_http_isonim_shm_conf_t    *zc, **zp, **existing;
+    ngx_shm_zone_t                *shm_zone;
+    ngx_str_t                     *value, name;
+    ngx_uint_t                     i;
+    off_t                          size, max_value;
+    u_char                         c;
+
+    value = cf->args->elts;
+    name = value[1];
+
+    if (name.len == 0 || name.len > NGX_HTTP_ISONIM_SHM_NAME_MAX) {
+        ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+            "isonim_shm_zone name \"%V\" must be 1 to %d characters",
+            &name, NGX_HTTP_ISONIM_SHM_NAME_MAX);
+        return NGX_CONF_ERROR;
+    }
+    for (i = 0; i < name.len; i++) {
+        c = name.data[i];
+        if (!((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '_')) {
+            ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                "isonim_shm_zone name \"%V\" may hold only [a-z0-9_]", &name);
+            return NGX_CONF_ERROR;
+        }
+    }
+
+    size = 0;
+    max_value = NGX_HTTP_ISONIM_SHM_DEFAULT_VALUE;
+
+    for (i = 2; i < cf->args->nelts; i++) {
+        if (value[i].len > 5 && ngx_strncmp(value[i].data, "size=", 5) == 0) {
+            size = ngx_http_isonim_shm_parse_size(value[i].data + 5,
+                                                  value[i].len - 5);
+            if (size == NGX_ERROR) {
+                goto invalid;
+            }
+            continue;
+        }
+        if (value[i].len > 10
+            && ngx_strncmp(value[i].data, "max_value=", 10) == 0)
+        {
+            max_value = ngx_http_isonim_shm_parse_size(value[i].data + 10,
+                                                       value[i].len - 10);
+            if (max_value == NGX_ERROR) {
+                goto invalid;
+            }
+            continue;
+        }
+        goto invalid;
+    }
+
+    if (size == 0) {
+        ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+            "isonim_shm_zone \"%V\" requires size=", &name);
+        return NGX_CONF_ERROR;
+    }
+    if (size < NGX_HTTP_ISONIM_SHM_MIN_SIZE
+        || size > NGX_HTTP_ISONIM_SHM_MAX_SIZE)
+    {
+        ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+            "isonim_shm_zone \"%V\": size=%O is outside 64k to 4g",
+            &name, size);
+        return NGX_CONF_ERROR;
+    }
+    if (max_value < 1 || max_value > size / 4) {
+        ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+            "isonim_shm_zone \"%V\": max_value=%O must be at least 1 and at "
+            "most a quarter of size= (%O)", &name, max_value, size / 4);
+        return NGX_CONF_ERROR;
+    }
+
+    existing = imcf->zones.elts;
+    for (i = 0; i < imcf->zones.nelts; i++) {
+        if (existing[i]->name.len == name.len
+            && ngx_strncmp(existing[i]->name.data, name.data, name.len) == 0)
+        {
+            ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                "isonim_shm_zone \"%V\" is declared twice", &name);
+            return NGX_CONF_ERROR;
+        }
+    }
+
+    zc = ngx_pcalloc(cf->pool, sizeof(ngx_http_isonim_shm_conf_t));
+    zp = ngx_array_push(&imcf->zones);
+    if (zc == NULL || zp == NULL) {
+        return NGX_CONF_ERROR;
+    }
+    zc->name = name;
+    zc->size = (size_t) size;
+    zc->max_value = (size_t) max_value;
+
+    /* Another module's zone of the same name makes this fail, with
+     * nginx's own message. */
+    shm_zone = ngx_shared_memory_add(cf, &name, zc->size,
+                                     &ngx_http_isonim_module);
+    if (shm_zone == NULL) {
+        return NGX_CONF_ERROR;
+    }
+    shm_zone->init = ngx_http_isonim_shm_init;
+    shm_zone->data = zc;
+    zc->shm_zone = shm_zone;
+    *zp = zc;
+
+    ngx_http_isonim_shm_check_reuse(cf, zc, shm_zone);
+    return NGX_CONF_OK;
+
+invalid:
+    ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+        "invalid isonim_shm_zone parameter \"%V\"", &value[i]);
+    return NGX_CONF_ERROR;
+}
+
+/* --- Helpers shm_table.nim calls (in a worker) ---------------------- */
+
+/* Looks up the zone this configuration declares as `name`.  Returns
+ * NGX_OK and fills *info, or NGX_DECLINED when there is none. */
+ngx_int_t
+ngx_http_isonim_shm_find(const u_char *name, size_t len,
+    ngx_http_isonim_shm_info_t *info)
+{
+    ngx_uint_t                    i;
+    ngx_slab_pool_t              *sp;
+    ngx_http_isonim_main_conf_t  *imcf;
+    ngx_http_isonim_shm_conf_t  **zones, *zc;
+
+    imcf = ngx_http_cycle_get_module_main_conf((ngx_cycle_t *) ngx_cycle,
+                                               ngx_http_isonim_module);
+    if (imcf == NULL) {
+        return NGX_DECLINED;
+    }
+    zones = imcf->zones.elts;
+    for (i = 0; i < imcf->zones.nelts; i++) {
+        zc = zones[i];
+        if (zc->name.len != len || ngx_memcmp(zc->name.data, name, len) != 0) {
+            continue;
+        }
+        sp = (ngx_slab_pool_t *) zc->shm_zone->shm.addr;  /* the zone itself */
+        info->pool = sp;
+        info->data = &sp->data;
+        info->size = zc->size;
+        info->max_value = zc->max_value;
+        return NGX_OK;
+    }
+    return NGX_DECLINED;
+}
+
+/* The zone's lock: the slab pool's own mutex, which the nginx master
+ * releases when a worker dies holding it (ngx_unlock_mutexes). */
+static ngx_shmtx_t *
+ngx_http_isonim_shm_mutex(ngx_slab_pool_t *sp)
+{
+    return &sp->mutex;
+}
+
+/* Takes the zone's lock.  Returns 1 when another process held it, so the
+ * caller had to wait (stats: lock waits), else 0. */
+ngx_int_t
+ngx_http_isonim_shm_lock(void *pool)
+{
+    ngx_shmtx_t  *mtx = ngx_http_isonim_shm_mutex(pool);
+
+    if (ngx_shmtx_trylock(mtx)) {
+        return 0;
+    }
+    ngx_shmtx_lock(mtx);
+    return 1;
+}
+
+void
+ngx_http_isonim_shm_unlock(void *pool)
+{
+    ngx_shmtx_unlock(ngx_http_isonim_shm_mutex(pool));
+}
+
+/* The slab allocator, with the zone's lock held.  NULL when it has no
+ * room for `size` bytes. */
+void *
+ngx_http_isonim_shm_alloc(void *pool, size_t size)
+{
+    return ngx_slab_alloc_locked(pool, size);
+}
+
+void
+ngx_http_isonim_shm_free(void *pool, void *p)
+{
+    ngx_slab_free_locked(pool, p);
+}
+
+/* The pool's page capacity and its free pages, in bytes. */
+void
+ngx_http_isonim_shm_pages(void *pool, uint64_t *total, uint64_t *free_bytes)
+{
+    ngx_slab_pool_t  *sp = pool;
+
+    *total = (uint64_t) (sp->last - sp->pages) * ngx_pagesize;
+    *free_bytes = (uint64_t) sp->pfree * ngx_pagesize;
 }
 
 /* ------------------------------------------------------------------ */

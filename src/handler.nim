@@ -162,15 +162,34 @@ else:
 
   proc NimMain() {.importc.}
 
+  var initFailure: string
+    ## Why registering the apps failed in this worker (e.g. an app bound a
+    ## shared-memory zone the configuration does not declare); "" when it
+    ## did not.  Every request of the worker then answers 500 with it
+    ## logged: its apps are only partly registered.
+
   proc nimModuleInit*() {.exportc: "nim_module_init", cdecl.} =
     ## Called once per worker, from C, before the first request.
     NimMain()
-    registerDefaultApps()
+    # Nothing may escape into nginx's C frames: an app's registerApps()
+    # that raises (ShmZoneError, ...) fails this worker's requests instead.
+    try:
+      registerDefaultApps()
+    except Exception as e:
+      initFailure = "registering the applications failed: " & $e.name &
+        ": " & e.msg
     startAsyncLoop()
 
   proc logTo(r: NgxHttpRequest; level: NgxUint; msg: string) =
     if msg.len > 0:
       ngx_http_isonim_log(r, level, unsafeAddr msg[0], csize_t(msg.len))
+
+  proc refusedByInitFailure(r: NgxHttpRequest): bool =
+    ## Logs and reports a failed app registration (see `initFailure`).
+    if initFailure.len == 0:
+      return false
+    logTo(r, NGX_LOG_ERR, initFailure)
+    true
 
   proc nginxSink(r: NgxHttpRequest): ResponseSink =
     ResponseSink(
@@ -224,6 +243,8 @@ else:
       logTo(r, NGX_LOG_ERR, "request view size mismatch between C (" &
         $viewSize & ") and Nim (" & $sizeof(RequestView) & ")")
       return NGX_HTTP_INTERNAL_SERVER_ERROR
+    if refusedByInitFailure(r):
+      return NGX_HTTP_INTERNAL_SERVER_ERROR
     # Nothing may escape into nginx's C frames.  serve() handles every
     # CatchableError itself; this catches what is left (a Defect in a
     # debug build, e.g. an index error in an app) so one bad request
@@ -256,6 +277,9 @@ else:
     if viewSize != csize_t(sizeof(RequestView)):
       logTo(r, NGX_LOG_ERR, "request view size mismatch between C (" &
         $viewSize & ") and Nim (" & $sizeof(RequestView) & ")")
+      ngx_http_isonim_finalize(r, NGX_HTTP_INTERNAL_SERVER_ERROR)
+      return
+    if refusedByInitFailure(r):
       ngx_http_isonim_finalize(r, NGX_HTTP_INTERNAL_SERVER_ERROR)
       return
     try:

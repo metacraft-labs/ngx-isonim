@@ -16,6 +16,8 @@
 ##   that raises (test_e2e.sh).
 ## * the server functions and the async app `rpc_echo` of rpc_app.nim
 ##   (test_rpc.nim).
+## * the shared-memory zone apps `shm_test` and `shm_undeclared` of
+##   shm_app.nim (test_shm_zone.nim).
 
 import std/[json, base64, strutils, monotimes, times]
 import ../../../src/app_registry
@@ -23,6 +25,7 @@ import ../../../src/ssr_router
 import isonim/ssr/streaming
 import async_app
 import rpc_app
+import shm_app
 
 proc echoJson(req: SsrRequest): string =
   ## The request as the renderer saw it.
@@ -88,6 +91,7 @@ proc spin(ms: int) =
 
 proc registerE2eApps*() =
   registerRpcApps()
+  registerShmApps()
 
   registerApp("echo", proc(req: SsrRequest; resp: SsrResponse): string =
     shape(req, resp)

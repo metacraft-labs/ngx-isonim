@@ -45,6 +45,8 @@ src/
   apps.nim                # Apps compiled in (and -d:ngxIsonimAppModule=<file>)
   ssr_router.nim          # routedApp: per-request routing via IsoNim's SSR router
   config.nim              # Directive model
+  shm_table.nim           # Shared-memory zones: shmTable, ShmTypedTable
+  ngx_http_isonim_shm.h   # The zone header's layout (C and Nim)
   nginx_types.nim         # nginx C API bindings (and their mocks)
 scripts/
   build-module.sh         # The module build (release or debug)
@@ -85,6 +87,28 @@ An application is compiled into the module with
 `scripts/build-module.sh release out.so -d:ngxIsonimAppModule=/abs/app.nim`;
 the module calls the app module's `registerApps()`.
 
+Node-wide state shared by every worker lives in a shared-memory zone,
+declared in the `http` block and bound by name (`src/shm_table.nim`):
+
+```nginx
+http {
+    # name: [a-z0-9_]{1,64}; size: 64k..4g; max_value: default 4k, <= size/4
+    isonim_shm_zone forum_routes size=8m max_value=1k;
+}
+```
+
+```nim
+import shm_table
+let routes = shmTable("forum_routes")          # ShmZoneError if undeclared
+var value: string
+let version = routes.get("example.org", value)  # Option[uint64]; value copied out
+case routes.putIf("example.org", "cell-7", version.get(0)).kind
+of stored: discard
+of conflict: discard                            # another worker stored first
+of tooLarge, full: discard
+discard routes.incr("admitted:inst-1", 1, 0, 500)  # bounded counter
+```
+
 ## Writing an App
 
 ```nim
@@ -98,4 +122,4 @@ registerApp("my_app", proc(req: SsrRequest; resp: SsrResponse): string =
   "<h1>Hello " & req.queryParam("name", "world") & "</h1>")
 ```
 
-See `isonim-specs/isonim-nginx.md` for the full contract.
+See `isonim-specs/spec/isonim-nginx.md` for the full contract.
