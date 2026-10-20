@@ -38,6 +38,7 @@ type
     sock: AsyncSocket
     sslCtx: SslContext
     alpn*: string            ## the protocol the server selected
+    serverCertDer*: string   ## the certificate the server presented (DER)
     status*: int             ## the response's :status (0: none yet)
     rstCode*: int            ## the RST_STREAM error code (-1: none)
     goaway*: bool
@@ -279,12 +280,15 @@ proc waitChange(p: PeerConn; deadline: MonoTime): Future[bool] =
   sleepAsync(int(left)).addCallback(proc() =
     if not res.finished: res.complete(false))
 
-proc newPeerContext*(certFile, keyFile, caFile: string): SslContext =
-  ## A TLS client context: the server is verified against `caFile`; the
-  ## client presents `certFile` / `keyFile` (none when empty).  ALPN offers
-  ## h2, then http/1.1, so that a server without HTTP/2 says so.
-  result = newContext(verifyMode = CVerifyPeer, certFile = certFile,
-                      keyFile = keyFile, caFile = caFile)
+proc newPeerContext*(certFile, keyFile, caFile: string;
+                     verifyServer = true): SslContext =
+  ## A TLS client context: the server is verified against `caFile` (its
+  ## chain and validity period; not at all with `verifyServer = false`,
+  ## for a test of what the node itself refuses); the client presents
+  ## `certFile` / `keyFile` (none when empty).  ALPN offers h2, then
+  ## http/1.1, so that a server without HTTP/2 says so.
+  result = newContext(verifyMode = (if verifyServer: CVerifyPeer else: CVerifyNone),
+                      certFile = certFile, keyFile = keyFile, caFile = caFile)
   const protos = "\x02h2\x08http/1.1"
   if SSL_CTX_set_alpn_protos(result.context, protos, cuint(protos.len)) != 0:
     raise newException(PeerError, "cannot set ALPN")
@@ -319,6 +323,12 @@ proc connectPeer*(ctx: SslContext; host: string; port: int;
   var plen: cuint
   SSL_get0_alpn_selected(p.sock.sslHandle, addr proto, addr plen)
   p.alpn = if plen > 0: ($proto)[0 ..< int(plen)] else: ""
+  # The certificate the server presented in this handshake (a renewal is
+  # seen by connections made after it).
+  let cert = SSL_get_peer_certificate(p.sock.sslHandle)
+  if cert != nil:
+    p.serverCertDer = i2d_X509(cert)
+    X509_free(cert)
   if p.alpn != "h2":
     p.sock.close()
     raise newException(PeerError, "HTTP/2 was not negotiated: the server " &

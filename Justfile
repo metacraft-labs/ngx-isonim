@@ -66,6 +66,7 @@ test-e2e: build-e2e
       nim c -r --hints:off -o:build/e2e/$t tests/e2e/$t.nim
     done
     nim c -r --hints:off -o:build/e2e/t_boundary_channel tests/integration/t_boundary_channel.nim
+    nim c -r --hints:off -o:build/e2e/t_boundary_reload tests/integration/t_boundary_reload.nim
     bash tests/e2e/test_streaming_debug.sh
     bash tests/e2e/test_rpc_asan.sh
     bash tests/e2e/test_shm_asan.sh
@@ -95,6 +96,16 @@ test-boundary: build-e2e
     set -euo pipefail
     export NGX_ISONIM_E2E_MODULE="$PWD/build/e2e/release/ngx_http_isonim_module.so"
     nim c -r --hints:off -o:build/e2e/t_boundary_channel tests/integration/t_boundary_channel.nim
+
+# The workload-certificate renewal of the Boundary listener alone (IFP-M24,
+# with its mutant; part of test-e2e): a renewed certificate reaches new
+# channels through a reload, and no channel outlives the certificate it was
+# opened on.
+test-boundary-reload: build-e2e
+    #!/usr/bin/env bash
+    set -euo pipefail
+    export NGX_ISONIM_E2E_MODULE="$PWD/build/e2e/release/ngx_http_isonim_module.so"
+    nim c -r --hints:off -o:build/e2e/t_boundary_reload tests/integration/t_boundary_reload.nim
 
 # CI: `just test-e2e`, its full output also in test-logs/test-e2e.log
 # (.github/workflows/e2e.yml uploads that directory).

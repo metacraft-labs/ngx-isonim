@@ -12,7 +12,11 @@
 # the certificates, the frames handed to nginx (ngx_alloc'd, freed once
 # written) and read from the request body, channels closed by the peer, by
 # a worker's death, by a certificate's expiry, by an oversized frame and by
-# a reload, and the calls those closes fail.
+# a reload, and the calls those closes fail.  Then the renewal tests of
+# tests/integration/t_boundary_reload.nim (without their mutant): a renewed
+# certificate loaded by a reload, the node's own certificate expiring under
+# channels kept on old workers, a refused renewal, and the channel request
+# the module refuses on its own expired certificate.
 #
 # Fails if ASan or UBSan reports anything.  Debug build with -d:useMalloc,
 # so that Nim's own objects are malloc'd and visible to ASan too.
@@ -75,6 +79,14 @@ PATH="${WORK}/bin:${PATH}" NGX_ISONIM_E2E_MODULE="${MODULE}" \
     "every worker's calls*" "serving, another app*" "the peer covers*" \
     "no channel:*" "a channel closes when*" "a reload keeps*" "a frame over*" \
     "ssl_verify_client on and*"
+
+nim c --hints:off -o:"${ROOT}/build/e2e/test_boundary_reload_asan" \
+  "${ROOT}/tests/integration/t_boundary_reload.nim" \
+  >"${WORK}/test-build-reload.log" 2>&1 || { tail -40 "${WORK}/test-build-reload.log"; exit 1; }
+
+PATH="${WORK}/bin:${PATH}" NGX_ISONIM_E2E_MODULE="${MODULE}" \
+  "${ROOT}/build/e2e/test_boundary_reload_asan" \
+    "the renewal reaches*" "negative control: without*" "an invalid renewal*"
 
 if find "${WORK}" -maxdepth 1 \( -name 'asan*' -o -name 'ubsan*' \) | grep -q .; then
   echo "A sanitizer reported:" >&2

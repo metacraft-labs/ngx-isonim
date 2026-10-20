@@ -1431,7 +1431,10 @@ typedef struct {
     ngx_str_t            peer_node;     /* from the peer's certificate     */
     ngx_http_isonim_srv_conf_t  *conf;
     time_t               peer_not_after;
-    ngx_event_t          expiry;        /* the peer certificate's notAfter */
+    time_t               own_not_after; /* the node's own certificate's,
+                                           the one this connection's TLS
+                                           handshake presented            */
+    ngx_event_t          expiry;        /* the earlier of the two notAfters */
     ngx_event_t          close_ev;      /* a close asked for (posted)      */
     ngx_chain_t         *busy;          /* frames handed to nginx, in
                                            order; their bytes are ngx_alloc'd
@@ -2012,6 +2015,23 @@ ngx_http_isonim_boundary_close_handler(ngx_event_t *ev)
     nim_async_pump();
 }
 
+/* When the channel must end: the earlier of the peer certificate's
+ * notAfter and the node's own (the certificate this connection's TLS
+ * handshake presented).  A channel never outlives either: a renewed
+ * certificate reaches new connections only (a reload's new workers), so
+ * a channel kept on an old worker through a reload (the hold below) is
+ * closed at its old certificate's notAfter at the latest. */
+static time_t
+ngx_http_isonim_boundary_ends(ngx_http_isonim_bch_t *ch)
+{
+    /* MUTATION (the node's own certificate's expiry not enforced): return
+     * ch->peer_not_after. */
+    if (ch->own_not_after > 0 && ch->own_not_after < ch->peer_not_after) {
+        return ch->own_not_after;
+    }
+    return ch->peer_not_after;
+}
+
 static void
 ngx_http_isonim_boundary_expiry_handler(ngx_event_t *ev)
 {
@@ -2019,15 +2039,22 @@ ngx_http_isonim_boundary_expiry_handler(ngx_event_t *ev)
     ngx_connection_t       *c = ch->request->connection;
     time_t                  left;
 
-    left = ch->peer_not_after - ngx_time();
+    left = ngx_http_isonim_boundary_ends(ch) - ngx_time();
     if (left > 0) {
         /* Long lifetimes are timed in steps of at most an hour. */
         ngx_add_timer(ev, (ngx_msec_t) ngx_min(left, 3600) * 1000);
         return;
     }
-    ngx_log_error(NGX_LOG_INFO, ch->request->connection->log, 0,
-                  "isonim boundary: the peer certificate of node \"%V\" "
-                  "expired; closing its channel", &ch->peer_node);
+    if (ch->peer_not_after <= ngx_time()) {
+        ngx_log_error(NGX_LOG_INFO, ch->request->connection->log, 0,
+                      "isonim boundary: the peer certificate of node \"%V\" "
+                      "expired; closing its channel", &ch->peer_node);
+    } else {
+        ngx_log_error(NGX_LOG_INFO, ch->request->connection->log, 0,
+                      "isonim boundary: this node's certificate that the "
+                      "channel of node \"%V\" was opened on expired; "
+                      "closing the channel", &ch->peer_node);
+    }
     ngx_http_isonim_boundary_finish(ch, NGX_ERROR);
     ngx_http_run_posted_requests(c);
     nim_async_pump();
@@ -2249,7 +2276,8 @@ ngx_http_isonim_boundary_opened(ngx_http_request_t *r)
         /* An expiry alone never keeps an exiting worker alive. */
         ch->expiry.cancelable = 1;
         ngx_add_timer(&ch->expiry, (ngx_msec_t)
-            ngx_min(ngx_max(ch->peer_not_after - ngx_time(), 0), 3600) * 1000);
+            ngx_min(ngx_max(ngx_http_isonim_boundary_ends(ch) - ngx_time(), 0),
+                    3600) * 1000);
     }
 
     ch->nim_state = nim_boundary_open(ch,
@@ -2279,8 +2307,8 @@ ngx_http_isonim_boundary_handler(ngx_http_request_t *r,
     ngx_connection_t       *c = r->connection;
     ngx_str_t               app, cls, node, own_app, own_cls, own_node;
     X509                   *cert;
-    ngx_int_t               rc, left;
-    time_t                  not_after = 0;
+    ngx_int_t               rc, left, own_left;
+    time_t                  not_after = 0, own_not_after = 0;
     static ngx_str_t        path = ngx_string(NGX_HTTP_ISONIM_BOUNDARY_PATH);
 
     if (r != r->main) {
@@ -2353,6 +2381,20 @@ ngx_http_isonim_boundary_handler(ngx_http_request_t *r,
                       "URI SAN); it cannot open channels");
         return NGX_HTTP_INTERNAL_SERVER_ERROR;
     }
+    /* SSL_get_certificate does not take a reference: not freed. */
+    own_left = ngx_http_isonim_cert_remaining(cert, &own_not_after);
+    if (own_left <= 0) {
+        /* The node serves a certificate that has expired: its renewal has
+         * not reached this worker (isonim-platform-control-plane.md §8.4,
+         * the renewal signal).  A peer that verifies the node refuses it
+         * at the handshake; one that did not is refused here, so no
+         * channel ever runs on an expired certificate of either end. */
+        ngx_log_error(NGX_LOG_ERR, c->log, 0,
+                      "isonim boundary: refused node \"%V\": this node's "
+                      "own certificate has expired (its renewal has not "
+                      "been loaded)", &node);
+        return NGX_HTTP_SERVICE_UNAVAILABLE;
+    }
     if (app.len != own_app.len
         || ngx_strncmp(app.data, own_app.data, app.len) != 0)
     {
@@ -2373,6 +2415,7 @@ ngx_http_isonim_boundary_handler(ngx_http_request_t *r,
     ch->node_id = own_node;
     ch->peer_node = node;
     ch->peer_not_after = not_after;
+    ch->own_not_after = own_not_after;
     ch->busy_tail = &ch->busy;
     ch->close_ev.handler = ngx_http_isonim_boundary_close_handler;
     ch->close_ev.data = ch;
