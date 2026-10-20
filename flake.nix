@@ -57,6 +57,16 @@
           ];
         });
 
+        # The same nginx without HTTP/2 (--with-http_v2_module removed):
+        # the Boundary channel test's negative control
+        # (tests/integration/t_boundary_channel.nim) shows that a test peer
+        # facing it fails explicitly instead of falling back to HTTP/1.1.
+        # Built only when that test asks for it, never by the dev shell.
+        nginxCompatNoHttp2 = nginxCompat.overrideAttrs (old: {
+          pname = "nginx-no-http2";
+          configureFlags = builtins.filter (f: f != "--with-http_v2_module") (old.configureFlags or [ ]);
+        });
+
         # Configured nginx headers derived from the compat build.
         nginxDevHeaders = pkgs.callPackage ./nix/nginx-dev-headers.nix {
           nginx = nginxCompat;
@@ -245,6 +255,7 @@
           baseline = baselineModule;
           nginx-with-isonim = nginxWithIsonim;
           nginx-baseline = nginxBaseline;
+          nginx-no-http2 = nginxCompatNoHttp2;
           default = ngxIsOnimModule;
         };
 

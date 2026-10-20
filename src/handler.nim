@@ -149,6 +149,7 @@ else:
   import nginx_http_adapter
   import apps
   import async_loop
+  import boundary     # its nim_boundary_* entry points
 
   type
     RequestView {.bycopy.} = object

@@ -25,3 +25,4 @@ tests/test_nginx_headers
 tests/test_rpc
 
 tests/test_shm_table
+tests/test_boundary

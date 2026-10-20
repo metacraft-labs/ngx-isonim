@@ -18,6 +18,8 @@
 ##   (test_rpc.nim).
 ## * the shared-memory zone apps `shm_test` and `shm_undeclared` of
 ##   shm_app.nim (test_shm_zone.nim).
+## * the Boundary channel app `boundary_test` of boundary_app.nim
+##   (tests/integration/t_boundary_channel.nim).
 
 import std/[json, base64, strutils, monotimes, times]
 import ../../../src/app_registry
@@ -26,6 +28,7 @@ import isonim/ssr/streaming
 import async_app
 import rpc_app
 import shm_app
+import boundary_app
 
 proc echoJson(req: SsrRequest): string =
   ## The request as the renderer saw it.
@@ -92,6 +95,7 @@ proc spin(ms: int) =
 proc registerE2eApps*() =
   registerRpcApps()
   registerShmApps()
+  registerBoundaryApps()
 
   registerApp("echo", proc(req: SsrRequest; resp: SsrResponse): string =
     shape(req, resp)

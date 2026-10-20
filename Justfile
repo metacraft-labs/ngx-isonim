@@ -43,6 +43,7 @@ test:
     nim c -r -d:isNginxTest {{isonim_path}} tests/test_nginx_headers.nim
     nim c -r -d:isNginxTest {{isonim_path}} tests/test_rpc.nim
     nim c -r -d:isNginxTest {{isonim_path}} tests/test_shm_table.nim
+    nim c -r -d:isNginxTest {{isonim_path}} tests/test_boundary.nim
     nim c -r tests/test_nimcache_is_worktree_local.nim
 
 # Run E2E integration tests (mock mode)
@@ -64,15 +65,19 @@ test-e2e: build-e2e
     for t in test_request_context test_csp_nonce test_max_buffer_size test_rpc test_shm_zone; do
       nim c -r --hints:off -o:build/e2e/$t tests/e2e/$t.nim
     done
+    nim c -r --hints:off -o:build/e2e/t_boundary_channel tests/integration/t_boundary_channel.nim
     bash tests/e2e/test_streaming_debug.sh
     bash tests/e2e/test_rpc_asan.sh
     bash tests/e2e/test_shm_asan.sh
+    bash tests/e2e/test_boundary_asan.sh
 
-# The isonim_rpc and shared-memory zone end-to-end tests against modules
-# built with AddressSanitizer (and UBSan for the zones; part of test-e2e)
+# The isonim_rpc, shared-memory zone and Boundary channel end-to-end tests
+# against modules built with AddressSanitizer (and UBSan for the zones and
+# the channels; part of test-e2e)
 test-e2e-asan:
     bash tests/e2e/test_rpc_asan.sh
     bash tests/e2e/test_shm_asan.sh
+    bash tests/e2e/test_boundary_asan.sh
 
 # The shared-memory zone end-to-end tests alone (with their mutants)
 test-e2e-shm: build-e2e
@@ -80,6 +85,16 @@ test-e2e-shm: build-e2e
     set -euo pipefail
     export NGX_ISONIM_E2E_MODULE="$PWD/build/e2e/release/ngx_http_isonim_module.so"
     nim c -r --hints:off -o:build/e2e/test_shm_zone tests/e2e/test_shm_zone.nim
+
+# The Interior-opened Boundary channel tests alone (with their mutants;
+# part of test-e2e).  Their negative control needs an nginx without HTTP/2:
+# NGX_ISONIM_NGINX_NO_HTTP2 names one, otherwise the test builds the flake's
+# nginx-no-http2.
+test-boundary: build-e2e
+    #!/usr/bin/env bash
+    set -euo pipefail
+    export NGX_ISONIM_E2E_MODULE="$PWD/build/e2e/release/ngx_http_isonim_module.so"
+    nim c -r --hints:off -o:build/e2e/t_boundary_channel tests/integration/t_boundary_channel.nim
 
 # CI: `just test-e2e`, its full output also in test-logs/test-e2e.log
 # (.github/workflows/e2e.yml uploads that directory).
@@ -168,7 +183,7 @@ clean:
     rm -f tests/test_streaming_handler tests/test_e2e_integration
     rm -f tests/test_isonim_e2e tests/test_request tests/test_response
     rm -f tests/test_nginx_headers tests/test_nimcache_is_worktree_local
-    rm -f tests/test_shm_table
+    rm -f tests/test_shm_table tests/test_boundary
     rm -rf tests/nimcache benchmarks/nimcache
 
 # Entering the dev shell from another git repository must write nothing there.

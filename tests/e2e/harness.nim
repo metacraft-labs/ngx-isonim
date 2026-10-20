@@ -73,10 +73,12 @@ proc siblingPaths(isonimSrc = ""): string =
    (if isonimSrc.len > 0: isonimSrc else: ws / "isonim/src"),
    ws / "nim-everywhere/src"].join(":")
 
-proc buildMutant*(name, file, original, replacement: string): string =
-  ## Builds the module from a copy of the sources in which `original`
-  ## (which must occur exactly once in `file`, relative to the repository)
-  ## is replaced by `replacement`.
+proc buildMutantEdits*(name, file: string;
+                       edits: openArray[(string, string)]): string =
+  ## Builds the module from a copy of the sources in which each edit's
+  ## original text (which must occur exactly once in `file`, relative to
+  ## the repository, when its turn comes) is replaced by its replacement:
+  ## a mutation that needs more than one place changed.
   let root = getTempDir() / ("ngx-isonim-mutant-" & name & "-" & $getCurrentProcessId())
   removeDir(root)
   createDir(root)
@@ -92,12 +94,14 @@ proc buildMutant*(name, file, original, replacement: string): string =
     copyDir(repoRoot.parentDir / "isonim/src", root / "isonim/src")
     isonimSrc = root / "isonim/src"
     path = root / file
-  let text = readFile(path)
-  let n = text.count(original)
-  if n != 1:
-    raise newException(ValueError, "mutation '" & name & "': expected one " &
-      "occurrence of the original text in " & file & ", found " & $n)
-  writeFile(path, text.replace(original, replacement))
+  var text = readFile(path)
+  for (original, replacement) in edits:
+    let n = text.count(original)
+    if n != 1:
+      raise newException(ValueError, "mutation '" & name & "': expected one " &
+        "occurrence of the original text in " & file & ", found " & $n)
+    text = text.replace(original, replacement)
+  writeFile(path, text)
   putEnv("NGX_ISONIM_PATHS", siblingPaths(isonimSrc))
   try:
     result = root / "ngx_http_isonim_module.so"
@@ -105,7 +109,13 @@ proc buildMutant*(name, file, original, replacement: string): string =
   finally:
     delEnv("NGX_ISONIM_PATHS")
 
-proc freePort(): int =
+proc buildMutant*(name, file, original, replacement: string): string =
+  ## Builds the module from a copy of the sources in which `original`
+  ## (which must occur exactly once in `file`, relative to the repository)
+  ## is replaced by `replacement`.
+  buildMutantEdits(name, file, [(original, replacement)])
+
+proc freePort*(): int =
   let s = newSocket()
   s.setSockOpt(OptReuseAddr, true)
   s.bindAddr(Port(0), "127.0.0.1")

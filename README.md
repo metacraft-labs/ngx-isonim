@@ -46,6 +46,7 @@ src/
   ssr_router.nim          # routedApp: per-request routing via IsoNim's SSR router
   config.nim              # Directive model
   shm_table.nim           # Shared-memory zones: shmTable, ShmTypedTable
+  boundary.nim            # Interior-opened Boundary channels: boundaryCall
   ngx_http_isonim_shm.h   # The zone header's layout (C and Nim)
   nginx_types.nim         # nginx C API bindings (and their mocks)
 scripts/
@@ -53,6 +54,7 @@ scripts/
 tests/
   test_*.nim              # Unit tests (mock mode)
   e2e/                    # E2E tests against real nginx
+  integration/            # Boundary channels against real nginx (HTTP/2 test peer)
 nix/
   nginx-dev-headers.nix   # Extracts configured nginx headers
   ngx-isonim-module.nix   # Builds the .so module (runs build-module.sh)
@@ -107,6 +109,37 @@ of stored: discard
 of conflict: discard                            # another worker stored first
 of tooLarge, full: discard
 discard routes.incr("admitted:inst-1", 1, 0, 500)  # bounded counter
+```
+
+An Interior service (the forum's write executor) can open channels to the
+node and receive the application's requests over them
+(`src/boundary.nim`): it sends `POST /_boundary/v1/channel` over HTTP/2 with
+its workload certificate and keeps the stream open, and keeps opening
+connections until every worker's handshake reports `min_channels`:
+
+```nginx
+server {
+    listen 10.0.0.5:8443 ssl reuseport;   # a private address
+    http2 on;
+    ssl_certificate     /run/credentials/forum/workload/cert.pem;
+    ssl_certificate_key /run/credentials/forum/workload/key.pem;
+    ssl_client_certificate /run/credentials/forum/workload/ca.pem;
+    ssl_verify_client on;                  # required by nginx -t
+    isonim_boundary on;
+    isonim_boundary_peer_class writer;     # the only class accepted
+    isonim_boundary_max_frame 1m;          # default 1m
+    isonim_boundary_min_channels 2;        # default 2
+}
+```
+
+```nim
+import boundary
+# A JSON object with a msg_id; completes with the peer's frame carrying it.
+let reply = await boundaryCall(toBytes($(%*{"v": 1, "msg_id": id, "type": t})),
+                               initDuration(seconds = 5))
+# Fails at once with BoundaryError(kind: bcNoChannel) when this worker has
+# no channel (nothing is queued), bcLost when the channel closes first,
+# bcTimeout at the deadline.
 ```
 
 ## Writing an App
