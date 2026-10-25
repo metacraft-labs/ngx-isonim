@@ -39,8 +39,11 @@ NGX_ISONIM_NIMCACHE="${ROOT}/.nimcache/module-asan-ubsan" \
   { tail -40 "${WORK}/build.log"; exit 1; }
 
 # Vacuity guard: the module really is instrumented with both sanitizers.
+# (nm's output is captured first: `nm | grep -q` under pipefail fails when
+# grep exits at the first match and nm then dies of SIGPIPE.)
+DYNSYMS="$(nm -D "${MODULE}")"
 for sym in __asan_init __ubsan_handle; do
-  if ! nm -D "${MODULE}" | grep -q "${sym}"; then
+  if ! grep -q "${sym}" <<<"${DYNSYMS}"; then
     echo "test_shm_asan.sh: the module has no ${sym}* symbol" >&2
     exit 1
   fi

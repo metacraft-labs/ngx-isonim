@@ -10,8 +10,11 @@
 # isonim_rpc_timeout (nim_rpc_timeout finalizes the request, which destroys
 # its pool and runs nim_rpc_released while the timeout is still on the
 # stack), a client that goes away mid-handler, 413 while reading, 500, and
-# the plain round trip.  Fails if ASan reports anything.  The falsifying
-# mutations of test_rpc.nim are not run here (they build release modules).
+# the plain round trip; and the streamed responses of async apps
+# (test_async_streaming.nim: a terminated response after the commit point,
+# the timeout after it, slow clients drained by the module's write handler,
+# clients that disconnect mid-body).  Fails if ASan reports anything.  The
+# falsifying mutations are not run here (they build release modules).
 #
 # Debug build with -d:useMalloc, so that Nim's own objects are malloc'd and
 # their use after free is visible too.
@@ -61,6 +64,15 @@ PATH="${WORK}/bin:${PATH}" NGX_ISONIM_E2E_MODULE="${MODULE}" \
     "a server function call*" "a 1 MiB*" "a body over*" "a chunked body*" \
     "a raising*" "isonim_rpc_timeout*" "a client that goes away*" \
     "an async app*" "a slow server*" "nginx stops*"
+
+nim c --hints:off -o:"${ROOT}/build/e2e/test_async_streaming_asan" \
+  "${ROOT}/tests/e2e/test_async_streaming.nim" \
+  >"${WORK}/test-build.log" 2>&1 || { tail -40 "${WORK}/test-build.log"; exit 1; }
+
+PATH="${WORK}/bin:${PATH}" NGX_ISONIM_E2E_MODULE="${MODULE}" \
+  "${ROOT}/build/e2e/test_async_streaming_asan" \
+    "the shell is*" "a handler that never*" "negative control*" "HEAD*" \
+    "50 slow clients*" "no alert*"
 
 if find "${WORK}" -maxdepth 1 -name 'asan*' | grep -q .; then
   echo "AddressSanitizer reported:" >&2

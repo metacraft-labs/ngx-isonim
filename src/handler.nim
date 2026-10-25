@@ -12,7 +12,9 @@
 ## At an `isonim_rpc` location the C side reads the body first and calls
 ## `nim_handle_rpc`, which starts the asynchronous pipeline of rpc.nim and
 ## runs Nim's event loop (async_loop.nim); `nim_rpc_timeout` and
-## `nim_rpc_released` are that request's timeout and end.
+## `nim_rpc_released` are that request's timeout and end.  An async app that
+## streams sends through the same sink while its request is in progress;
+## the C module's write handler drains what nginx could not send at once.
 ##
 ## Compiled with `-d:isNginxTest` the module instead provides
 ## `serveRecorded` / `serveMockRequest` / `serveRpcRecorded`: the same
@@ -102,17 +104,19 @@ when defined(isNginxTest):
       state*: RpcState
 
   proc startRpcRecorded*(req: SsrRequest; appName = "";
-                         timeoutMs = 0): RpcRecording =
+                         timeoutMs = 0; opts = RpcOptions();
+                         recording = RecordingOptions()): RpcRecording =
     ## Starts an isonim_rpc request over a recording sink.  `timeoutMs`
     ## models isonim_rpc_timeout with an asyncdispatch timer (nginx uses its
     ## own).  Drive the event loop (`poll`) until `finished`.
     let r = RpcRecording()
     let st = startRpc(req, appName,
-      recordingSink(req, addr r.response, RecordingOptions()),
+      recordingSink(req, addr r.response, recording),
       proc(rc: NgxInt) =
         doAssert not r.finished, "request finalized twice"
         r.finished = true
-        r.finalRc = rc)
+        r.finalRc = rc,
+      opts)
     r.state = st
     st.run()
     if timeoutMs > 0:
@@ -121,9 +125,10 @@ when defined(isNginxTest):
     r
 
   proc serveRpcRecorded*(req: SsrRequest; appName = "";
-                         timeoutMs = 0): RpcRecording =
+                         timeoutMs = 0; opts = RpcOptions();
+                         recording = RecordingOptions()): RpcRecording =
     ## Runs one isonim_rpc request to its end.
-    result = startRpcRecorded(req, appName, timeoutMs)
+    result = startRpcRecorded(req, appName, timeoutMs, opts, recording)
     while not result.finished:
       poll(10)
 
@@ -270,7 +275,8 @@ else:
 
   proc nimHandleRpc*(r: NgxHttpRequest; cctx: pointer; view: ptr RequestView;
                      viewSize: csize_t; body: ptr char; bodyLen: csize_t;
-                     appName: ptr char; appNameLen: csize_t)
+                     appName: ptr char; appNameLen: csize_t;
+                     hydration: NgxInt; maxBufferSize: csize_t)
       {.exportc: "nim_handle_rpc", cdecl.} =
     ## Called by the C body handler once the request body is read.  Starts
     ## the handler; the request is finalized (ngx_http_isonim_finalize)
@@ -291,7 +297,9 @@ else:
       if bodyLen > 0:
         copyMem(addr bodyText[0], body, int(bodyLen))
       let st = startRpc(buildRequest(view, bodyText), name, nginxSink(r),
-        proc(rc: NgxInt) = ngx_http_isonim_finalize(r, rc))
+        proc(rc: NgxInt) = ngx_http_isonim_finalize(r, rc),
+        RpcOptions(maxBufferSize: int(maxBufferSize),
+                   hydration: hydration != 0))
       # Owned by the C side until the request pool is released
       # (nim_rpc_released); bound before anything can finalize it.
       GC_ref(st)

@@ -121,7 +121,8 @@ extern void nim_handle_rpc(
     ngx_http_request_t *r, ngx_http_isonim_rpc_ctx_t *ctx,
     ngx_http_isonim_request_view_t *view, size_t view_size,
     const u_char *body, size_t body_len,
-    const u_char *app_name, size_t app_name_len);
+    const u_char *app_name, size_t app_name_len,
+    ngx_int_t hydration, size_t max_buffer_size);
 /* rpc.nim: isonim_rpc_timeout expired. */
 extern void nim_rpc_timeout(void *nim_state);
 /* rpc.nim: the request pool is being destroyed; drop the state. */
@@ -462,6 +463,117 @@ ngx_http_isonim_merge_loc_conf(ngx_conf_t *cf, void *parent, void *child)
 }
 
 /* ------------------------------------------------------------------ */
+/* A streamed isonim_rpc response: nginx's backpressure.              */
+/*                                                                    */
+/* An async app's flush passes its bytes down the output chain while  */
+/* the request is still in progress (its handler is awaiting).  What  */
+/* the socket does not take at once stays in the chain (r->out,       */
+/* c->buffered: ngx_http_output_filter returned NGX_AGAIN).  Nothing  */
+/* in nginx would send it before the request is finalized, so the     */
+/* request's write event handler does, as the socket drains: the      */
+/* event loop never waits for a slow client, and nginx holds the      */
+/* unsent bytes.  send_timeout bounds a client that stops reading; a  */
+/* failed send terminates the request, whose pool cleanup tells Nim   */
+/* (nim_rpc_released), so the handler's next write raises.  Once the */
+/* last buffer is sent, finalizing hands the rest to ngx_http_writer. */
+/* ------------------------------------------------------------------ */
+
+static ngx_int_t ngx_http_isonim_rpc_arm(ngx_http_request_t *r);
+
+static ngx_http_isonim_rpc_ctx_t *
+ngx_http_isonim_rpc_ctx(ngx_http_request_t *r)
+{
+    ngx_http_isonim_rpc_ctx_t  *ctx;
+
+    ctx = ngx_http_get_module_ctx(r, ngx_http_isonim_module);
+    if (ctx == NULL || ctx->kind != NGX_HTTP_ISONIM_CTX_RPC
+        || ctx->request != r)
+    {
+        return NULL;
+    }
+    return ctx;
+}
+
+static void
+ngx_http_isonim_rpc_writer(ngx_http_request_t *r)
+{
+    ngx_int_t          rc;
+    ngx_event_t       *wev;
+    ngx_connection_t  *c;
+
+    c = r->connection;
+    wev = c->write;
+
+    if (wev->timedout) {
+        ngx_log_error(NGX_LOG_INFO, c->log, NGX_ETIMEDOUT,
+                      "isonim: client timed out while a streamed response "
+                      "was being sent");
+        c->timedout = 1;
+        ngx_http_finalize_request(r, NGX_HTTP_REQUEST_TIME_OUT);
+        return;
+    }
+
+    if (wev->delayed || r->aio) {
+        if (!wev->delayed) {
+            (void) ngx_http_isonim_rpc_arm(r);
+        }
+        return;
+    }
+
+    rc = ngx_http_output_filter(r, NULL);
+    if (rc == NGX_ERROR) {
+        /* The client went away: terminate; the pool cleanup releases the
+         * Nim state. */
+        ngx_http_finalize_request(r, NGX_ERROR);
+        return;
+    }
+
+    if (ngx_http_isonim_rpc_arm(r) != NGX_OK) {
+        ngx_http_finalize_request(r, NGX_ERROR);
+    }
+}
+
+/* Keeps the write event (and send_timeout) armed while nginx holds unsent
+ * bytes of the request; disarms the timer once they are sent. */
+static ngx_int_t
+ngx_http_isonim_rpc_arm(ngx_http_request_t *r)
+{
+    ngx_event_t               *wev;
+    ngx_connection_t          *c;
+    ngx_http_core_loc_conf_t  *clcf;
+
+    c = r->connection;
+    wev = c->write;
+    clcf = ngx_http_get_module_loc_conf(r, ngx_http_core_module);
+
+    if (r->buffered || r->postponed || c->buffered) {
+        if (!wev->delayed) {
+            ngx_add_timer(wev, clcf->send_timeout);
+        }
+        return ngx_handle_write_event(wev, clcf->send_lowat);
+    }
+    if (wev->timer_set) {
+        ngx_del_timer(wev);
+    }
+    return NGX_OK;
+}
+
+/* After a body send of an isonim_rpc request that did not end it: the
+ * write handler above drains what nginx could not send. */
+static void
+ngx_http_isonim_rpc_hold(ngx_http_request_t *r)
+{
+    if (ngx_http_isonim_rpc_ctx(r) == NULL) {
+        return;     /* an SSR location: its content handler finalizes */
+    }
+    r->write_event_handler = ngx_http_isonim_rpc_writer;
+    if (ngx_http_isonim_rpc_arm(r) != NGX_OK) {
+        ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
+                      "isonim: cannot watch the connection for writing");
+    }
+}
+
+/* ------------------------------------------------------------------ */
 /* Helpers called from Nim (serve.nim's nginx sink).                  */
 /* ------------------------------------------------------------------ */
 
@@ -533,6 +645,7 @@ ngx_http_isonim_send_body(ngx_http_request_t *r, const u_char *data,
 {
     ngx_buf_t    *b;
     ngx_chain_t   out;
+    ngx_int_t     rc;
 
     if (len == 0 && !flush && !last) return NGX_OK;
 
@@ -553,7 +666,12 @@ ngx_http_isonim_send_body(ngx_http_request_t *r, const u_char *data,
 
     out.buf = b;
     out.next = NULL;
-    return ngx_http_output_filter(r, &out);
+    rc = ngx_http_output_filter(r, &out);
+
+    if (rc != NGX_ERROR && !last) {
+        ngx_http_isonim_rpc_hold(r);
+    }
+    return rc;
 }
 
 /* Writes one line to the request's error log. */
@@ -644,6 +762,7 @@ void
 ngx_http_isonim_finalize(ngx_http_request_t *r, ngx_int_t rc)
 {
     ngx_http_isonim_rpc_ctx_t  *ctx;
+    ngx_connection_t           *c;
 
     ctx = ngx_http_get_module_ctx(r, ngx_http_isonim_module);
     if (ctx != NULL && ctx->kind == NGX_HTTP_ISONIM_CTX_RPC
@@ -651,7 +770,21 @@ ngx_http_isonim_finalize(ngx_http_request_t *r, ngx_int_t rc)
     {
         ngx_del_timer(&ctx->timeout);
     }
+    c = r->connection;
     ngx_http_finalize_request(r, rc);
+
+    /* NGX_ERROR (a streamed response terminated after its headers) makes
+     * nginx post a request that terminates this one, and only
+     * ngx_http_request_handler runs posted requests.  Nim calls this from
+     * the event loop's timer and descriptor events and from the
+     * isonim_rpc_timeout timer, outside any request handler, so post the
+     * connection's write event: nginx then runs the request handler,
+     * which terminates the request on the event loop's next turn.  (Running
+     * the posted requests here instead could free the request while a C
+     * frame below still holds it, e.g. nim_handle_rpc's body handler.) */
+    if (rc == NGX_ERROR && !c->destroyed) {
+        ngx_post_event(c->write, &ngx_posted_events);
+    }
 }
 
 /* Binds rpc.nim's state to the request, so that the timeout and the
@@ -787,7 +920,8 @@ ngx_http_isonim_rpc_body_handler(ngx_http_request_t *r)
 
     ngx_http_isonim_fill_view(r, &view);
     nim_handle_rpc(r, ctx, &view, sizeof(view), body, len,
-                   conf->rpc_app.data, conf->rpc_app.len);
+                   conf->rpc_app.data, conf->rpc_app.len,
+                   conf->hydration, conf->max_buffer_size);
 }
 
 static ngx_http_request_body_filter_pt  ngx_http_isonim_next_body_filter;

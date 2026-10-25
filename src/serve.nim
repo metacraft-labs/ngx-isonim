@@ -29,6 +29,11 @@
 ## `serve` returns what the nginx content handler must return: `NGX_OK` (or
 ## `NGX_AGAIN` while nginx still holds unsent bytes), `NGX_ERROR` to drop the
 ## connection, or an HTTP status for nginx to answer with its own error page.
+##
+## The transport itself (`Transport`: the pending bytes, the size limit, the
+## commit point, `flush` and `endBody`) is exported: rpc.nim streams an async
+## app's response through the same one, so both kinds of location put the
+## same bytes and buffer flags on nginx's output chain.
 
 import nginx_types, config, app_registry
 import isonim/ssr/markers
@@ -53,8 +58,10 @@ type
       ## connection is gone.
     log*: proc(level: NgxUint; msg: string)
 
-  ServeState = ref object
-    req: SsrRequest
+  Transport* = ref object
+    ## One response on its way to nginx: the body bytes accepted and not
+    ## yet passed down, the size limit, and the commit point.  `serve` (SSR
+    ## renderers) and rpc.nim (streaming async apps) drive the same one.
     resp: SsrResponse
     opts: ServeOptions
     sink: ResponseSink
@@ -62,7 +69,9 @@ type
     total: int           ## body bytes accepted so far
     headersSent: bool
     headerOnly: bool     ## nginx said: no body for this response
-    lastRc: NgxInt
+    lastRc*: NgxInt
+      ## What nginx last answered (NGX_OK, or NGX_AGAIN while it holds
+      ## unsent bytes).
 
 proc hydrationScript*(nonce: string): string =
   ## The bootstrap script that records events until the client runtime
@@ -70,74 +79,112 @@ proc hydrationScript*(nonce: string): string =
   ## reads and replays), carrying this response's CSP nonce.
   generateHydrationScript(nonce = nonce)
 
-proc commit(st: ServeState; contentLength: int64) =
+proc newTransport*(resp: SsrResponse; opts: ServeOptions;
+                   sink: ResponseSink): Transport =
+  Transport(resp: resp, opts: opts, sink: sink, lastRc: NGX_OK)
+
+proc committed*(t: Transport): bool =
+  ## The status and headers were sent.
+  t.headersSent
+
+proc bodyBytes*(t: Transport): int =
+  ## Body bytes accepted so far (what `isonim_ssr_max_buffer_size` bounds).
+  t.total
+
+proc restart*(t: Transport; resp: SsrResponse) =
+  ## Drops everything accepted and starts over with `resp`; only before the
+  ## commit point (a framework error replacing what a handler shaped).
+  doAssert not t.headersSent, "restart after the commit point"
+  t.resp = resp
+  t.pending.setLen(0)
+  t.total = 0
+
+proc useResponse*(t: Transport; resp: SsrResponse) =
+  ## The response whose status and headers the commit sends, when the
+  ## handler replaced its context's (before the commit point only).
+  if not t.headersSent:
+    t.resp = resp
+
+proc commit(t: Transport; contentLength: int64) =
   ## Sends the status and headers.  Called once, before the first body byte.
-  st.resp.markCommitted()
-  st.headersSent = true
-  let rc = st.sink.sendHeader(st.resp, contentLength)
+  t.resp.markCommitted()
+  t.headersSent = true
+  let rc = t.sink.sendHeader(t.resp, contentLength)
   if rc == NGX_DONE:
-    st.headerOnly = true
-    st.pending.setLen(0)
+    t.headerOnly = true
+    t.pending.setLen(0)
   elif rc == NGX_ERROR or rc > NGX_OK:
     raise newException(ClientConnectionError,
       "sending the response header failed (rc " & $rc & ")")
   else:
-    st.lastRc = rc
+    t.lastRc = rc
 
-proc send(st: ServeState; flush, last: bool) =
-  if st.headerOnly:
-    st.pending.setLen(0)
+proc send(t: Transport; flush, last: bool) =
+  if t.headerOnly:
+    t.pending.setLen(0)
     return
   let rc =
-    if st.pending.len > 0:
-      st.sink.sendBody(st.pending.toOpenArray(0, st.pending.high), flush, last)
+    if t.pending.len > 0:
+      t.sink.sendBody(t.pending.toOpenArray(0, t.pending.high), flush, last)
     else:
       var empty: array[0, char]
-      st.sink.sendBody(empty, flush, last)
-  st.pending.setLen(0)
+      t.sink.sendBody(empty, flush, last)
+  t.pending.setLen(0)
   if rc == NGX_ERROR:
     raise newException(ClientConnectionError,
       "sending the response body failed; the client connection is gone")
-  st.lastRc = rc
+  t.lastRc = rc
 
-proc write(st: ServeState; data: openArray[char]) =
-  if st.resp.isRedirect:
+proc write*(t: Transport; data: openArray[char]) =
+  ## Accepts body bytes; they reach nginx on the next `flush` or `endBody`.
+  if t.resp.isRedirect:
     raise newException(ValueError,
-      "the response is a redirect to " & st.resp.location &
+      "the response is a redirect to " & t.resp.location &
       "; a redirect carries no body")
-  if st.opts.maxBufferSize > 0 and
-      st.total + data.len > st.opts.maxBufferSize:
+  if t.opts.maxBufferSize > 0 and
+      t.total + data.len > t.opts.maxBufferSize:
     raise newException(ResponseTooLargeError,
       "the response body exceeds isonim_ssr_max_buffer_size (" &
-      $st.opts.maxBufferSize & " bytes)")
-  st.total += data.len
-  if not st.headerOnly and data.len > 0:
-    let old = st.pending.len
-    st.pending.setLen(old + data.len)
-    copyMem(addr st.pending[old], unsafeAddr data[0], data.len)
+      $t.opts.maxBufferSize & " bytes)")
+  t.total += data.len
+  if not t.headerOnly and data.len > 0:
+    let old = t.pending.len
+    t.pending.setLen(old + data.len)
+    copyMem(addr t.pending[old], unsafeAddr data[0], data.len)
 
-proc flush(st: ServeState) =
-  if st.opts.mode == tmBuffered:
+proc flush*(t: Transport) =
+  ## Streaming transport: commits the response (chunked) on the first call,
+  ## then passes what is pending to nginx with its `flush` flag.  Buffered:
+  ## nothing.
+  if t.opts.mode == tmBuffered:
     return
-  if not st.headersSent:
-    st.commit(if st.resp.isRedirect: 0 else: -1)
-  if st.pending.len > 0:
-    st.send(flush = true, last = false)
+  if not t.headersSent:
+    t.commit(if t.resp.isRedirect: 0 else: -1)
+  if t.pending.len > 0:
+    t.send(flush = true, last = false)
 
-proc finish(st: ServeState) =
+proc endBody*(t: Transport; whole: bool) =
+  ## Ends the response with nginx's last buffer.  A response not committed
+  ## yet goes out with `Content-Length` when `whole`, chunked otherwise; a
+  ## redirect goes out with no body.
+  if t.resp.isRedirect:
+    t.pending.setLen(0)
+    if not t.headersSent:
+      t.commit(0)
+    t.send(flush = false, last = true)
+    return
+  let wasCommitted = t.headersSent
+  if not t.headersSent:
+    t.commit(if whole: int64(t.pending.len) else: -1)
+  t.send(flush = t.opts.mode == tmStreaming and (wasCommitted or not whole),
+         last = true)
+
+proc finish(t: Transport) =
   ## The renderer returned: hydration script, then the end of the body.
-  if st.resp.isRedirect:
-    st.pending.setLen(0)
-    if not st.headersSent:
-      st.commit(0)
-    st.send(flush = false, last = true)
-    return
-  if st.opts.hydration:
-    let script = hydrationScript(st.resp.cspNonce)
-    st.write(script.toOpenArray(0, script.high))
-  if not st.headersSent:
-    st.commit(if st.opts.mode == tmBuffered: int64(st.pending.len) else: -1)
-  st.send(flush = st.opts.mode == tmStreaming, last = true)
+  if t.opts.hydration and not t.resp.isRedirect:
+    let script = hydrationScript(t.resp.cspNonce)
+    t.write(script.toOpenArray(0, script.high))
+  t.endBody(whole = t.opts.mode == tmBuffered)
 
 proc serve*(req: SsrRequest; app: AppEntry; opts: ServeOptions;
             sink: ResponseSink): NgxInt =
@@ -155,8 +202,8 @@ proc serve*(req: SsrRequest; app: AppEntry; opts: ServeOptions;
       "serve it at an isonim_rpc location (isonim_rpc_app)")
     return NGX_HTTP_INTERNAL_SERVER_ERROR
 
-  let st = ServeState(req: req, resp: newSsrResponse(), opts: opts,
-                      sink: sink, lastRc: NGX_OK)
+  let resp = newSsrResponse()
+  let st = newTransport(resp, opts, sink)
   let body = newResponseBody(
     proc(data: openArray[char]) = st.write(data),
     proc() = st.flush())
@@ -164,11 +211,11 @@ proc serve*(req: SsrRequest; app: AppEntry; opts: ServeOptions;
   try:
     case app.kind
     of akString:
-      let html = app.render(req, st.resp)
-      if not st.resp.isRedirect:
+      let html = app.render(req, resp)
+      if not resp.isRedirect:
         st.write(html.toOpenArray(0, html.high))
     of akStreaming:
-      app.renderStream(req, st.resp, body)
+      app.renderStream(req, resp, body)
     of akAsync:
       discard   # refused above
     st.finish()

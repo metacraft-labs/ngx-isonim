@@ -6,7 +6,8 @@
 ##   (scripts/build-module.sh, `-d:ngxIsonimTestApps`), or uses the one named
 ##   by `NGX_ISONIM_E2E_MODULE` (the Justfile builds it once for all tests).
 ## * `buildMutant()` builds the module from a copy of the sources with one
-##   exact text replacement: the tests use it to show that an assertion
+##   exact text replacement (`buildMutantEdits` / `buildMutantFiles`: several,
+##   in one file / in several): the tests use it to show that an assertion
 ##   fails when the behaviour it guards is broken (falsifying mutations).
 ##   A file under `isonim/` (e.g. `isonim/src/isonim/server/response.nim`)
 ##   is mutated in a copy of the isonim sibling's `src/`, which the mutant
@@ -73,12 +74,14 @@ proc siblingPaths(isonimSrc = ""): string =
    (if isonimSrc.len > 0: isonimSrc else: ws / "isonim/src"),
    ws / "nim-everywhere/src"].join(":")
 
-proc buildMutantEdits*(name, file: string;
-                       edits: openArray[(string, string)]): string =
-  ## Builds the module from a copy of the sources in which each edit's
-  ## original text (which must occur exactly once in `file`, relative to
-  ## the repository, when its turn comes) is replaced by its replacement:
-  ## a mutation that needs more than one place changed.
+proc buildMutantFiles*(name: string;
+                       edits: openArray[(string, string, string)]): string =
+  ## Builds the module from a copy of the sources in which each edit
+  ## `(file, original, replacement)` replaces `original` (which must occur
+  ## exactly once in `file`, relative to the repository, when its turn
+  ## comes): a mutation that changes more than one place, possibly in more
+  ## than one file.  Files under `isonim/` are IsoNim's (see the module
+  ## documentation).
   let root = getTempDir() / ("ngx-isonim-mutant-" & name & "-" & $getCurrentProcessId())
   removeDir(root)
   createDir(root)
@@ -88,26 +91,36 @@ proc buildMutantEdits*(name, file: string;
   copyDir(repoRoot / "tests/e2e/apps", root / "tests/e2e/apps")
   copyFile(repoRoot / "nim.cfg", root / "nim.cfg")
   var isonimSrc = ""
-  var path = root / file
-  if file.startsWith("isonim/"):
-    # The file is IsoNim's: mutate a copy of the sibling's src/.
-    copyDir(repoRoot.parentDir / "isonim/src", root / "isonim/src")
-    isonimSrc = root / "isonim/src"
-    path = root / file
-  var text = readFile(path)
-  for (original, replacement) in edits:
+  for (file, original, replacement) in edits:
+    if file.startsWith("isonim/") and isonimSrc.len == 0:
+      # The file is IsoNim's: mutate a copy of the sibling's src/.
+      copyDir(repoRoot.parentDir / "isonim/src", root / "isonim/src")
+      isonimSrc = root / "isonim/src"
+    let path = root / file
+    var text = readFile(path)
     let n = text.count(original)
     if n != 1:
       raise newException(ValueError, "mutation '" & name & "': expected one " &
         "occurrence of the original text in " & file & ", found " & $n)
     text = text.replace(original, replacement)
-  writeFile(path, text)
+    writeFile(path, text)
   putEnv("NGX_ISONIM_PATHS", siblingPaths(isonimSrc))
   try:
     result = root / "ngx_http_isonim_module.so"
     buildModuleAt(root, "release", result, @["-d:ngxIsonimTestApps"])
   finally:
     delEnv("NGX_ISONIM_PATHS")
+
+proc buildMutantEdits*(name, file: string;
+                       edits: openArray[(string, string)]): string =
+  ## Builds the module from a copy of the sources in which each edit's
+  ## original text (which must occur exactly once in `file`, relative to
+  ## the repository, when its turn comes) is replaced by its replacement:
+  ## a mutation that needs more than one place changed.
+  var all: seq[(string, string, string)]
+  for (original, replacement) in edits:
+    all.add((file, original, replacement))
+  buildMutantFiles(name, all)
 
 proc buildMutant*(name, file, original, replacement: string): string =
   ## Builds the module from a copy of the sources in which `original`
