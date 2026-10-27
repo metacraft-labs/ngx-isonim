@@ -41,7 +41,9 @@
 ##
 ## After the request has ended (timed out, or released by nginx) every write
 ## and flush of the handler raises `ClientConnectionError`, so a handler
-## still running stops at its next write without touching the request.
+## still running stops at its next write without touching the request.  The
+## writer stays on the context for that reason: it is set once, in `run`,
+## and never cleared.
 ##
 ## `startRpc` / `run` / `timeout` / `release` are the transport-independent
 ## core; the nginx glue (`nim_handle_rpc`, `nim_rpc_timeout`,
@@ -86,9 +88,6 @@ proc rpcRequestsReleased*(): int =
 proc where(st: RpcState): string =
   " (" & st.ctx.request.httpMethod & " " & st.ctx.request.rawUri &
     (if st.appName.len > 0: ", app \"" & st.appName & "\"" else: "") & ")"
-
-proc dropWriter(st: RpcState) =
-  unbindBodyWriter(st.ctx, st.body)
 
 proc ended(st: RpcState): bool =
   st.done or st.gone
@@ -188,7 +187,6 @@ proc deliver(st: RpcState) =
   st.finish(rc)
 
 proc complete(st: RpcState; fut: Future[void]) =
-  st.dropWriter()
   if st.ended:
     return
   st.done = true
@@ -223,7 +221,6 @@ proc timeout*(st: RpcState) =
     return
   st.done = true
   st.timedOut = true
-  st.dropWriter()
   if st.transport.committed:
     st.terminate(NGX_LOG_ERR,
       "the handler did not complete within isonim_rpc_timeout")
@@ -238,7 +235,6 @@ proc release*(st: RpcState) =
   if not st.gone:
     inc releasedCount
   st.gone = true
-  st.dropWriter()
 
 proc startRpc*(req: SsrRequest; appName: string; sink: ResponseSink;
                finish: proc(rc: NgxInt); opts = RpcOptions()): RpcState =
@@ -270,7 +266,13 @@ proc run*(st: RpcState) =
           "(register it with registerAsyncApp)"))
       st.finish(NGX_HTTP_INTERNAL_SERVER_ERROR)
       return
-    bindBodyWriter(st.ctx, st.body, st.opts.hydration)
+    # The app's body writer and hydration flag, on IsoNim's context.  The
+    # writer is never taken back: after the request has ended its writes
+    # raise `ClientConnectionError` (`checkLive`), which stops a handler
+    # still running.  A nil writer instead would make a streaming page fall
+    # back to buffering into `ctx.responseBody`, silently, for no one.
+    st.ctx.setBodyWriter(st.body)
+    st.ctx.hydration = st.opts.hydration
   var fut: Future[void]
   try:
     fut = if st.app.isNil: dispatchRpc(st.ctx) else: st.app.handle(st.ctx)

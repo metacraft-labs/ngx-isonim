@@ -23,9 +23,11 @@
 ## verdict) and completes a future, leaving the response in the context.
 ## It is served at an `isonim_rpc` location named by `isonim_rpc_app`
 ## (rpc.nim); a route manifest's `manifestApp` is one.  While it runs,
-## `bodyWriter(ctx)` is its response body writer: what it writes there and
+## `ctx.bodyWriter` is its response body writer: what it writes there and
 ## flushes is streamed to the client (the first flush commits the response);
 ## a handler that never flushes is answered whole, with `Content-Length`.
+## `ctx.hydration` is the location's `isonim_ssr_hydration`.  Both are
+## IsoNim's `RequestContext` fields, set by rpc.nim before the app runs.
 
 import std/tables
 import request, response, response_body
@@ -63,52 +65,6 @@ type
       handle*: RequestHandler
 
 var appRegistry: Table[string, AppEntry]
-
-type
-  RpcBinding = object
-    body: ResponseBody
-    hydration: bool
-
-var rpcBindings {.threadvar.}: Table[pointer, RpcBinding]
-  ## What the module gives every isonim_rpc request whose async app is
-  ## running, by its context: the body writer and the location's
-  ## `isonim_ssr_hydration`.  IsoNim's `RequestContext` has no field for
-  ## them; rpc.nim binds them when the app starts and drops them when the
-  ## request ends.
-
-proc binding(ctx: RequestContext): RpcBinding =
-  result = rpcBindings.getOrDefault(cast[pointer](ctx), RpcBinding())
-  if result.body.isNil:
-    raise newException(ValueError, "this request context has no response " &
-      "body writer: it is not a running isonim_rpc async app's request")
-
-proc bodyWriter*(ctx: RequestContext): ResponseBody =
-  ## The response body writer of an async app's request (`write`, `flush`,
-  ## `outputStream`).  Its first `flush` commits the status and headers and
-  ## streams the response (chunked); every later flush is sent at once.
-  ## Bytes in `ctx.responseBody` (`ctx.write`, `respondJson`) belong to the
-  ## same body, in the order they were written.  Raises `ValueError` for a
-  ## context no running isonim_rpc request owns: the server-function
-  ## registry's, or one whose request has ended.
-  ctx.binding.body
-
-proc hydrationEnabled*(ctx: RequestContext): bool =
-  ## The location's `isonim_ssr_hydration`: whether the app should write
-  ## IsoNim's hydration bootstrap script (the module appends none at an
-  ## isonim_rpc location).  Raises like `bodyWriter`.
-  ctx.binding.hydration
-
-proc bindBodyWriter*(ctx: RequestContext; body: ResponseBody;
-                     hydration: bool) =
-  ## Used by rpc.nim when the app starts.
-  rpcBindings[cast[pointer](ctx)] = RpcBinding(body: body,
-                                               hydration: hydration)
-
-proc unbindBodyWriter*(ctx: RequestContext; body: ResponseBody) =
-  ## Used by rpc.nim when the request ends (completed, timed out, released).
-  let key = cast[pointer](ctx)
-  if rpcBindings.getOrDefault(key, RpcBinding()).body == body:
-    rpcBindings.del(key)
 
 proc stringApp*(renderer: SsrRenderer): AppEntry =
   AppEntry(kind: akString, render: renderer)

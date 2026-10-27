@@ -57,6 +57,14 @@ proc header(r: RecordedResponse; name: string): string =
   for (k, v) in r.headers:
     if cmpIgnoreCase(k, name) == 0: return v
 
+proc writeFailure(body: ResponseBody): string =
+  ## The message of the ClientConnectionError a write raises ("" when it
+  ## raises nothing; any other exception propagates).
+  try:
+    body.write("x")
+  except ClientConnectionError as e:
+    result = e.msg
+
 proc logged(r: RpcRecording; part: string): bool =
   for (_, msg) in r.response.log:
     if part in msg: return true
@@ -328,21 +336,50 @@ suite "isonim_rpc - streaming async apps (IFP-M30)":
     check not r.finished
     check r.response.body == "<shell>"
 
-  test "bodyWriter belongs to the running request only":
+  test "ctx.bodyWriter stays with the request after it ended, and raises":
+    # rpc.nim never takes the writer back: were it cleared (nil) when the
+    # request ends, a streaming page still running would fall back to
+    # buffering into ctx.responseBody, silently and for no one, instead of
+    # stopping at its next write.  Each way a request ends is checked:
+    # completed, timed out, released by nginx.
     var ctxSeen: RequestContext
     registerAsyncApp("keep_ctx", proc(ctx: RequestContext): Future[void] {.async.} =
       ctxSeen = ctx
-      discard ctx.bodyWriter)
-    discard serveRpcRecorded(post("/c", ""), "keep_ctx")
-    expect ValueError:
-      discard ctxSeen.bodyWriter
-    expect ValueError:
-      discard newRequestContext(post("/x", "")).bodyWriter
+      check ctx.bodyWriter != nil)
+    let done = serveRpcRecorded(post("/c", ""), "keep_ctx")
+    check done.response.status == 200
+    check ctxSeen.bodyWriter != nil
+    if ctxSeen.bodyWriter != nil:
+      expect ClientConnectionError:
+        ctxSeen.bodyWriter.write("x")
+      expect ClientConnectionError:
+        ctxSeen.bodyWriter.flush()
 
-  test "hydrationEnabled carries the location's isonim_ssr_hydration":
+    var gate = newFuture[void]("never")
+    registerAsyncApp("hang", proc(ctx: RequestContext): Future[void] {.async.} =
+      ctxSeen = ctx
+      await gate)
+    let timedOut = serveRpcRecorded(post("/t", ""), "hang", timeoutMs = 20)
+    check timedOut.response.status == 504
+    check ctxSeen.bodyWriter != nil
+    if ctxSeen.bodyWriter != nil:
+      check writeFailure(ctxSeen.bodyWriter).contains("isonim_rpc_timeout")
+
+    let released = startRpcRecorded(post("/r", ""), "hang")
+    released.state.release()
+    check ctxSeen.bodyWriter != nil
+    if ctxSeen.bodyWriter != nil:
+      check writeFailure(ctxSeen.bodyWriter).contains("released")
+    gate.complete()
+    while hasPendingOperations(): poll(5)
+
+    # A context no isonim_rpc app runs in has no writer.
+    check newRequestContext(post("/x", "")).bodyWriter.isNil
+
+  test "ctx.hydration carries the location's isonim_ssr_hydration":
     var seen: seq[bool]
     registerAsyncApp("hy", proc(ctx: RequestContext): Future[void] {.async.} =
-      seen.add ctx.hydrationEnabled)
+      seen.add ctx.hydration)
     discard serveRpcRecorded(post("/h", ""), "hy",
                              opts = RpcOptions(hydration: true))
     discard serveRpcRecorded(post("/h", ""), "hy",

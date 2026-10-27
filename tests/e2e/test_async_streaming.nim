@@ -163,19 +163,24 @@ proc request(path: string; extra = ""): string =
   "GET " & path & " HTTP/1.1\r\nHost: 127.0.0.1\r\n" & extra &
     "Connection: close\r\n\r\n"
 
+proc readable(s: Socket; deadline: MonoTime): bool =
+  ## Whether the socket has something to read (data, a closed peer, or on
+  ## a listener a connection to accept) before `deadline`.
+  let left = (deadline - getMonoTime()).inMilliseconds
+  if left <= 0:
+    return false
+  var pfd = TPollfd(fd: cint(s.getFd), events: POLLIN)
+  let ready = posix.poll(addr pfd, 1, cint(left))
+  if ready < 0:
+    raiseOSError(osLastError())
+  ready > 0
+
 proc recvSome(s: Socket; deadline: MonoTime): string =
   ## What the socket has now (up to 64 KiB), waiting for it until
   ## `deadline` (TimeoutError); "" when the peer closed.  `net.recv` with a
   ## size waits for all of it, so this reads the descriptor directly.
-  let left = (deadline - getMonoTime()).inMilliseconds
-  if left <= 0:
+  if not s.readable(deadline):
     raise newException(TimeoutError, "deadline passed")
-  var pfd = TPollfd(fd: cint(s.getFd), events: POLLIN)
-  let ready = posix.poll(addr pfd, 1, cint(left))
-  if ready == 0:
-    raise newException(TimeoutError, "deadline passed")
-  if ready < 0:
-    raiseOSError(osLastError())
   result = newString(65536)
   let n = posix.recv(s.getFd, addr result[0], 65536, 0)
   if n < 0:
@@ -205,6 +210,7 @@ type AwaitRun = object
   chunked: bool
   contentLength: bool
   otherServed: bool       ## another location answered while the app awaited
+  appConnected: bool      ## the app connected to the test's socket in time
   body: string
   terminated: bool
   invalid: bool
@@ -240,10 +246,13 @@ proc awaitScenario(n: Nginx; deadlineMs = 10_000): AwaitRun =
   let other = curl(["-sS", "--max-time", "5", n.url("/whole/x")])
   result.otherServed = other.exitCode == 0 and other.output == wholeBody
   # 3. The byte the app awaits (its connection is in the listener's
-  #    backlog, or arrives now).
+  #    backlog, or arrives now).  An app that never connects (e.g. the
+  #    worker crashed) fails the run at the deadline instead of hanging it.
   var app: Socket
-  listener.accept(app)
-  app.send("Z")
+  if listener.readable(getMonoTime() + initDuration(milliseconds = deadlineMs)):
+    listener.accept(app)
+    result.appConnected = true
+    app.send("Z")
   # 4. The rest and the terminating chunk.
   try:
     while true:
@@ -252,7 +261,8 @@ proc awaitScenario(n: Nginx; deadlineMs = 10_000): AwaitRun =
       raw.add got
   except TimeoutError:
     discard
-  app.close()
+  if result.appConnected:
+    app.close()
   c.close()
   listener.close()
   head = parseHead(raw)
@@ -276,6 +286,7 @@ suite "test_async_app_streams_after_awaiting":
   test "the shell is on the wire before the awaited byte; the rest follows":
     let r = n.awaitScenario()
     echo "    ", r
+    check r.appConnected
     check r.shellFirst
     check not r.restEarly
     check r.chunked

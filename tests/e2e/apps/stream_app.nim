@@ -1,6 +1,6 @@
 ## stream_app.nim
 ##
-## Async apps that stream their response (`bodyWriter(ctx)`), compiled into
+## Async apps that stream their response (`ctx.bodyWriter`), compiled into
 ## the end-to-end module (registered by e2e_apps.nim) and driven over real
 ## nginx by tests/e2e/test_async_streaming.nim.
 ##
