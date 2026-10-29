@@ -62,7 +62,7 @@ proc rpcArgs(n: Nginx; path: string; extra: openArray[string] = []): seq[string]
     "-H", "Origin: " & origin,
     "-H", "Sec-Fetch-Site: same-origin",
     "-H", "X-CSRF-Token: " & anonToken,
-    "-H", "X-Isonim-Context: inc-e2e:1",
+    "-H", "Isonim-Context: inc-e2e:1",
     "-H", "Cookie: __Host-Anon-CSRF=" & anonToken] & @extra & @[n.url(path)]
 
 proc call(n: Nginx; fn, body: string; extra: openArray[string] = []):
@@ -157,7 +157,7 @@ suite "isonim_rpc against real nginx":
     check r.headers.headerValues("Content-Type") == @["application/json"]
     check r.headers.headerValues("Cache-Control") ==
       @["private, no-cache, no-store, must-revalidate"]
-    check r.headers.headerValues("X-Isonim-Context") == @["inc-e2e:1"]
+    check r.headers.headerValues("Isonim-Context") == @["inc-e2e:1"]
 
   test "a 1 MiB argument arrives whole (read from nginx's temporary file)":
     let f = bodyFile("1m", 1024 * 1024)
