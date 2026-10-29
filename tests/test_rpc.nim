@@ -13,7 +13,12 @@
 ## (IFP-M30): the commit on the first flush, the chunk and last-buffer
 ## flags, whole responses, HEAD/204/304, failures and the size limit before
 ## and after the commit point, the timeout after it, a failed send, a
-## released request, and the body writer's lifetime.  The body reading, the
+## released request, and the body writer's lifetime; and the long-lived
+## streams of spec/isonim-nginx.md ("Backpressure", "Buffer limit"): the
+## limit bounds each buffer between two flushes, not the whole body, and
+## `unsentBytes` is the unflushed bytes plus what nginx holds (the sink's
+## `holdSent` keeps what it is sent as unsent, a client that reads nothing,
+## until the test drains it).  The body reading, the
 ## 413s, the worker's event loop, and the streaming over the wire
 ## (backpressure, slow and disconnecting clients) are covered against real
 ## nginx (tests/e2e/test_rpc.nim, tests/e2e/test_async_streaming.nim).
@@ -54,6 +59,9 @@ proc misuse(ctx: RequestContext; n: int): Future[int] {.server(auth = aPublic, c
   registryWriterWasNil = ctx.bodyWriter.isNil
   ctx.bodyWriter.write("oops")
   return n
+
+var unsentReports: seq[int]
+var unsentGate: Future[void]
 
 proc post(path, body: string; contentType = "application/json";
           browser = true; httpMethod = "POST"): SsrRequest =
@@ -253,6 +261,24 @@ suite "isonim_rpc - streaming async apps (IFP-M30)":
       for i in 0 ..< 10:
         body.write(repeat('x', 100))
         body.flush())
+    registerAsyncApp("big_buffer", proc(ctx: RequestContext): Future[void] {.async.} =
+      let body = ctx.bodyWriter
+      body.write(repeat('y', 100))
+      body.flush()
+      for i in 0 ..< 5:
+        body.write(repeat('x', 100))
+      body.flush())
+    registerAsyncApp("unsent_report", proc(ctx: RequestContext): Future[void] {.async.} =
+      let body = ctx.bodyWriter
+      ctx.write("ab")                      # the context's body counts too
+      body.write("cde")
+      unsentReports.add body.unsentBytes   # 5: nothing flushed
+      body.flush()
+      unsentReports.add body.unsentBytes   # 5: flushed, held by "nginx"
+      await unsentGate
+      unsentReports.add body.unsentBytes   # 0: the test drained it
+      body.write("f")
+      unsentReports.add body.unsentBytes)  # 1
     registerAsyncApp("keeps_writing", proc(ctx: RequestContext): Future[void] {.async.} =
       let body = ctx.bodyWriter
       body.write("<shell>")
@@ -319,16 +345,43 @@ suite "isonim_rpc - streaming async apps (IFP-M30)":
       check r.response.sends.len == 0
       check r.finalRc == NGX_OK
 
-  test "isonim_ssr_max_buffer_size after the commit point terminates, logged":
+  test "isonim_ssr_max_buffer_size bounds each buffer: 1000 bytes in 100-byte flushes pass a 450-byte limit":
     let r = serveRpcRecorded(post("/big", ""), "big",
                              opts = RpcOptions(maxBufferSize: 450))
+    check r.finalRc == NGX_OK
+    check r.response.body == repeat('x', 1000)
+    check not r.logged("isonim_ssr_max_buffer_size")
+
+  test "isonim_ssr_max_buffer_size after the commit point: a buffer over it terminates, logged":
+    let r = serveRpcRecorded(post("/bb", ""), "big_buffer",
+                             opts = RpcOptions(maxBufferSize: 450))
     check r.finalRc == NGX_ERROR
-    check r.response.body == repeat('x', 400)
+    check r.response.body == repeat('y', 100)
     check r.logged("exceeds isonim_ssr_max_buffer_size (450 bytes)")
     let whole = serveRpcRecorded(post("/w", ""), "whole",
                                  opts = RpcOptions(maxBufferSize: 5))
     check whole.response.status == 500
     check whole.logged("exceeds isonim_ssr_max_buffer_size (5 bytes); responding 500")
+
+  test "unsentBytes: the unflushed bytes, then what nginx holds, then what is left after the client read":
+    unsentReports = @[]
+    unsentGate = newFuture[void]("unsent gate")
+    let r = startRpcRecorded(post("/u", ""), "unsent_report",
+                             recording = RecordingOptions(holdSent: true))
+    while unsentReports.len < 2: poll(5)
+    check r.response.held == 5
+    r.response.held = 0                     # the client read everything
+    unsentGate.complete()
+    while not r.finished: poll(5)
+    check unsentReports == @[5, 5, 0, 1]
+    check r.response.body == "abcdef"
+    check r.finalRc == NGX_OK
+
+  test "unsentBytes after the request has ended raises ClientConnectionError":
+    let r = serveRpcRecorded(post("/u2", ""), "whole")
+    check r.finished
+    expect ClientConnectionError:
+      discard r.state.body.unsentBytes
 
   test "isonim_rpc_timeout after the commit point: terminated, logged, late writes raise":
     let r = startRpcRecorded(post("/k", ""), "keeps_writing", timeoutMs = 30)

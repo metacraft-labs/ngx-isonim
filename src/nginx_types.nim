@@ -103,6 +103,10 @@ when not defined(isNginxTest):
 
   proc ngx_http_isonim_rpc_bind*(ctx: pointer; state: pointer)
     {.importc: "ngx_http_isonim_rpc_bind", cdecl.}
+  proc ngx_http_isonim_rpc_unsent*(r: NgxHttpRequest): csize_t
+    {.importc: "ngx_http_isonim_rpc_unsent", cdecl.}
+    ## The flushed body bytes of an isonim_rpc response nginx has not
+    ## written yet (0 for any other request).
 
   proc ngx_http_isonim_async_arm*(msec: NgxInt)
     {.importc: "ngx_http_isonim_async_arm", cdecl.}

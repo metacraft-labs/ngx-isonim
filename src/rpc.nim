@@ -28,6 +28,13 @@
 ##   the C module's write handler sends them as the socket drains, so a
 ##   slow client never blocks the event loop.  For `HEAD`, `204` and `304`
 ##   the commit sends the headers only and later writes are discarded.
+##   `isonim_ssr_max_buffer_size` bounds each buffer between two flushes, not
+##   the whole body, and the body writer's `unsentBytes` reports what the
+##   client has not read yet (the transport's unflushed bytes plus what
+##   nginx holds), so a handler can stream for as long as it likes and
+##   bound a slow client itself (spec/isonim-nginx.md, "Backpressure",
+##   "Buffer limit").  The C module frees each flushed buffer once nginx
+##   has written it, so such a stream's memory is what is unsent.
 ##
 ## Then the request is finalized.  What the client sees when something
 ## fails:
@@ -35,7 +42,7 @@
 ## | Failure | Nothing sent yet | After the commit point |
 ## | :--- | :--- | :--- |
 ## | handler raises (an app) / its server function raised | `500` `{"error":"internal"}`, logged | response terminated without its last chunk, logged |
-## | body over `isonim_ssr_max_buffer_size` | `500` `{"error":"internal"}`, logged naming the limit | response terminated, logged naming the limit |
+## | a buffer over `isonim_ssr_max_buffer_size` | `500` `{"error":"internal"}`, logged naming the limit | response terminated, logged naming the limit |
 ## | `isonim_rpc_timeout` expires | `504` `{"error":"timeout"}`, logged | response terminated without its last chunk, logged |
 ## | client gone | request terminated by nginx (`499`); the result is dropped | the next write or flush raises `ClientConnectionError`; the request is released |
 ##
@@ -143,6 +150,12 @@ proc bodyFlush(st: RpcState) =
     st.drainContextBody()
     st.transport.flush())
 
+proc bodyUnsent(st: RpcState): int =
+  ## What the handler wrote that the client has not read (raises, as a
+  ## write does, once the request has ended).
+  st.checkLive()
+  st.ctx.responseBody.len + st.transport.unsentBytes
+
 proc fail(st: RpcState; status: int; error: string) =
   ## Replaces whatever the handler shaped with a framework error (only
   ## before the commit point).
@@ -243,10 +256,11 @@ proc startRpc*(req: SsrRequest; appName: string; sink: ResponseSink;
                     opts: opts, sink: sink, finish: finish)
   st.transport = newTransport(st.ctx.response,
     ServeOptions(appName: appName, hydration: false, mode: tmStreaming,
-                 maxBufferSize: opts.maxBufferSize), sink)
+                 maxBufferSize: opts.maxBufferSize, limitPerBuffer: true), sink)
   st.body = newResponseBody(
     proc(data: openArray[char]) = st.bodyWrite(data),
-    proc() = st.bodyFlush())
+    proc() = st.bodyFlush(),
+    proc(): int = st.bodyUnsent())
   st
 
 proc hydrationEnabled*(st: RpcState): bool =

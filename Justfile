@@ -62,7 +62,7 @@ test-e2e: build-e2e
     set -euo pipefail
     export NGX_ISONIM_E2E_MODULE="$PWD/build/e2e/release/ngx_http_isonim_module.so"
     bash tests/e2e/test_e2e.sh
-    for t in test_request_context test_csp_nonce test_max_buffer_size test_rpc test_async_streaming test_shm_zone; do
+    for t in test_request_context test_csp_nonce test_max_buffer_size test_rpc test_async_streaming test_long_stream test_shm_zone; do
       nim c -r --hints:off -o:build/e2e/$t tests/e2e/$t.nim
     done
     nim c -r --hints:off -o:build/e2e/t_boundary_channel tests/integration/t_boundary_channel.nim
@@ -87,6 +87,14 @@ test-e2e-streaming: build-e2e
     set -euo pipefail
     export NGX_ISONIM_E2E_MODULE="$PWD/build/e2e/release/ngx_http_isonim_module.so"
     nim c -r --hints:off -o:build/e2e/test_async_streaming tests/e2e/test_async_streaming.nim
+
+# The long-lived streamed responses alone (bounded memory, the per-buffer
+# limit, unsentBytes; with their mutants; part of test-e2e)
+test-e2e-long-stream: build-e2e
+    #!/usr/bin/env bash
+    set -euo pipefail
+    export NGX_ISONIM_E2E_MODULE="$PWD/build/e2e/release/ngx_http_isonim_module.so"
+    nim c -r --hints:off -o:build/e2e/test_long_stream tests/e2e/test_long_stream.nim
 
 # The shared-memory zone end-to-end tests alone (with their mutants)
 test-e2e-shm: build-e2e

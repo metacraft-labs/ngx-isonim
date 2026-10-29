@@ -17,13 +17,24 @@
 ## * `stream_big`: `size` bytes of `patternByte` in flushed parts of `part`
 ##   bytes, pausing `pause_ms` between parts (a producer that takes its
 ##   time, so that clients disconnect while the handler is still running).
-## * `stream_stats`: how many isonim_rpc requests this worker has released.
+## * `stream_stats`: how many isonim_rpc requests this worker has released,
+##   and what the last `stream_unsent` observed.
+## * `stream_unsent`: writes `part`-byte parts, each flushed, until the body
+##   writer's `unsentBytes` exceeds `threshold` (a client that stops
+##   reading) or `limit` bytes are written; records both in `unsentStats`;
+##   then waits (polling every 10 ms, at most 30 s) until `unsentBytes` is
+##   0 again (the client read everything), records that, and ends.  The
+##   long-lived streams of spec/isonim-nginx.md ("Backpressure").
 
 import std/[asyncdispatch, asyncnet, strutils, json]
 import isonim/server/context
 import ../../../src/app_registry
 import ../../../src/rpc
 import stream_pattern
+
+var unsentStats = %*{"started": false, "stopped": false, "written": 0, "unsent": 0,
+                      "drained": false}
+  ## What the last `stream_unsent` observed (`stream_stats` answers it).
 
 proc registerStreamApps*() =
   registerAsyncApp("stream_await", proc(ctx: RequestContext): Future[void] {.async.} =
@@ -81,5 +92,35 @@ proc registerStreamApps*() =
       if pauseMs > 0 and written < size:
         await sleepAsync(pauseMs))
 
+  registerAsyncApp("stream_unsent", proc(ctx: RequestContext): Future[void] {.async.} =
+    let body = ctx.bodyWriter
+    let part = max(1, parseInt(ctx.request.queryParam("part", "16384")))
+    let threshold = parseInt(ctx.request.queryParam("threshold", "524288"))
+    let limit = parseInt(ctx.request.queryParam("limit", "67108864"))
+    unsentStats = %*{"started": true, "stopped": false, "written": 0, "unsent": 0,
+                     "drained": false}
+    var buf = newString(part)
+    var written = 0
+    var unsent = 0
+    while written < limit:
+      for i in 0 ..< part:
+        buf[i] = patternByte(written + i)
+      body.write(buf)
+      body.flush()
+      written += part
+      unsent = body.unsentBytes
+      if unsent > threshold:
+        break
+      # Let the event loop run nginx's write events between parts, as a
+      # real producer between events would.
+      await sleepAsync(0)
+    unsentStats = %*{"started": true, "stopped": true, "written": written, "unsent": unsent,
+                     "drained": false}
+    var waited = 0
+    while body.unsentBytes > 0 and waited < 30_000:
+      await sleepAsync(10)
+      waited += 10
+    unsentStats["drained"] = %(body.unsentBytes == 0))
+
   registerAsyncApp("stream_stats", proc(ctx: RequestContext): Future[void] {.async.} =
-    ctx.respondJson(200, $(%*{"released": rpcRequestsReleased()})))
+    ctx.respondJson(200, $(%*{"released": rpcRequestsReleased(), "unsent": unsentStats})))

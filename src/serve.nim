@@ -45,6 +45,11 @@ type
     hydration*: bool
     mode*: TransportMode
     maxBufferSize*: int   ## bytes; 0 = unlimited
+    limitPerBuffer*: bool
+      ## `maxBufferSize` bounds each buffer between two flushes instead of
+      ## the whole body (isonim_rpc locations: a streamed response may be
+      ## sent for as long as its handler writes; spec/isonim-nginx.md,
+      ## "Buffer limit").
 
   ResponseSink* = object
     ## The transport's view of nginx.
@@ -57,6 +62,9 @@ type
       ## Passes bytes down the output filter chain.  NGX_ERROR means the
       ## connection is gone.
     log*: proc(level: NgxUint; msg: string)
+    unsent*: proc(): int
+      ## The body bytes nginx accepted and has not written to the socket
+      ## yet (a slow client); nil reports 0.
 
   Transport* = ref object
     ## One response on its way to nginx: the body bytes accepted and not
@@ -86,6 +94,11 @@ proc newTransport*(resp: SsrResponse; opts: ServeOptions;
 proc committed*(t: Transport): bool =
   ## The status and headers were sent.
   t.headersSent
+
+proc unsentBytes*(t: Transport): int =
+  ## The body bytes written and not yet read by the client: those not
+  ## passed to nginx yet, and those nginx holds unsent.
+  t.pending.len + (if t.sink.unsent.isNil: 0 else: t.sink.unsent())
 
 proc bodyBytes*(t: Transport): int =
   ## Body bytes accepted so far (what `isonim_ssr_max_buffer_size` bounds).
@@ -141,11 +154,16 @@ proc write*(t: Transport; data: openArray[char]) =
     raise newException(ValueError,
       "the response is a redirect to " & t.resp.location &
       "; a redirect carries no body")
-  if t.opts.maxBufferSize > 0 and
-      t.total + data.len > t.opts.maxBufferSize:
-    raise newException(ResponseTooLargeError,
-      "the response body exceeds isonim_ssr_max_buffer_size (" &
-      $t.opts.maxBufferSize & " bytes)")
+  if t.opts.maxBufferSize > 0:
+    if t.opts.limitPerBuffer:
+      if t.pending.len + data.len > t.opts.maxBufferSize:
+        raise newException(ResponseTooLargeError,
+          "a buffer of the response (the bytes between two flushes) exceeds " &
+          "isonim_ssr_max_buffer_size (" & $t.opts.maxBufferSize & " bytes)")
+    elif t.total + data.len > t.opts.maxBufferSize:
+      raise newException(ResponseTooLargeError,
+        "the response body exceeds isonim_ssr_max_buffer_size (" &
+        $t.opts.maxBufferSize & " bytes)")
   t.total += data.len
   if not t.headerOnly and data.len > 0:
     let old = t.pending.len

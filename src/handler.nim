@@ -50,8 +50,14 @@ when defined(isNginxTest):
         ## The concatenated body bytes that were sent.
       sends*: seq[RecordedSend]
       log*: seq[(NgxUint, string)]
+      held*: int
+        ## With `holdSent`: the bytes sent and not "read" (set it to 0 to
+        ## drain).
 
     RecordingOptions* = object
+      holdSent*: bool
+        ## The sink keeps every byte it is sent as unsent (a client that
+        ## reads nothing) until the test drains it (`RecordedResponse.held`).
       failBodySendAt*: int
         ## 1-based index of the sendBody call that fails as if the client
         ## had gone away (NGX_ERROR); 0 = never.
@@ -83,9 +89,12 @@ when defined(isNginxTest):
           copyMem(addr s[0], unsafeAddr data[0], data.len)
         recPtr.sends.add RecordedSend(data: s, flush: flush, last: last)
         recPtr.body.add s
+        if recording.holdSent:
+          recPtr.held += s.len
         NGX_OK,
       log: proc(level: NgxUint; msg: string) =
         recPtr.log.add((level, msg)),
+      unsent: proc(): int = recPtr.held,
     )
 
   proc serveRecorded*(req: SsrRequest; app: AppEntry; opts: ServeOptions;
@@ -222,6 +231,8 @@ else:
           csize_t(data.len), NgxInt(ord(flush)), NgxInt(ord(last))),
       log: proc(level: NgxUint; msg: string) =
         logTo(r, level, msg),
+      unsent: proc(): int =
+        int(ngx_http_isonim_rpc_unsent(r)),
     )
 
   proc buildRequest(view: ptr RequestView; body = ""): SsrRequest =

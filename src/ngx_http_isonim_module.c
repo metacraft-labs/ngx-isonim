@@ -113,6 +113,14 @@ typedef struct {
     void                *nim_state;  /* rpc.nim's RpcState (GC_ref'd)       */
     size_t               body_limit; /* isonim_rpc_max_body_size; 0 = none  */
     off_t                body_read;  /* body bytes seen by the body filter  */
+    /* The response body's buffers handed to nginx, oldest first.  Their
+     * bytes live outside the request pool (ngx_alloc) and are freed as
+     * soon as nginx has written them (ngx_http_isonim_rpc_reclaim), so a
+     * response streamed for hours holds only what the client has not read
+     * yet (spec/isonim-nginx.md, "Backpressure"). */
+    ngx_chain_t         *out_busy;
+    ngx_chain_t        **out_busy_tail;
+    ngx_chain_t         *out_free;   /* emptied links and bufs, reused       */
 } ngx_http_isonim_rpc_ctx_t;
 
 /* rpc.nim: starts the request (the body is read).  Nim binds its state to
@@ -479,6 +487,47 @@ ngx_http_isonim_merge_loc_conf(ngx_conf_t *cf, void *parent, void *child)
 /* ------------------------------------------------------------------ */
 
 static ngx_int_t ngx_http_isonim_rpc_arm(ngx_http_request_t *r);
+static ngx_http_isonim_rpc_ctx_t *ngx_http_isonim_rpc_ctx(ngx_http_request_t *r);
+
+/* Frees the bytes of the response buffers nginx has written (they are
+ * written, and emptied, in order); keeps their links for reuse. */
+static void
+ngx_http_isonim_rpc_reclaim(ngx_http_isonim_rpc_ctx_t *ctx)
+{
+    ngx_chain_t  *cl;
+
+    while (ctx->out_busy != NULL && ngx_buf_size(ctx->out_busy->buf) == 0) {
+        cl = ctx->out_busy;
+        ctx->out_busy = cl->next;
+        ngx_free(cl->buf->start);
+        cl->buf->start = NULL;
+        cl->next = ctx->out_free;
+        ctx->out_free = cl;
+    }
+    if (ctx->out_busy == NULL) {
+        ctx->out_busy_tail = &ctx->out_busy;
+    }
+}
+
+/* Called from Nim: the flushed body bytes of an isonim_rpc response that
+ * nginx has not written to the socket yet; 0 for any other request. */
+size_t
+ngx_http_isonim_rpc_unsent(ngx_http_request_t *r)
+{
+    ngx_http_isonim_rpc_ctx_t  *ctx;
+    ngx_chain_t                *cl;
+    size_t                      n = 0;
+
+    ctx = ngx_http_isonim_rpc_ctx(r);
+    if (ctx == NULL) {
+        return 0;
+    }
+    ngx_http_isonim_rpc_reclaim(ctx);
+    for (cl = ctx->out_busy; cl; cl = cl->next) {
+        n += (size_t) ngx_buf_size(cl->buf);
+    }
+    return n;
+}
 
 static ngx_http_isonim_rpc_ctx_t *
 ngx_http_isonim_rpc_ctx(ngx_http_request_t *r)
@@ -521,6 +570,9 @@ ngx_http_isonim_rpc_writer(ngx_http_request_t *r)
     }
 
     rc = ngx_http_output_filter(r, NULL);
+    if (ngx_http_isonim_rpc_ctx(r) != NULL) {
+        ngx_http_isonim_rpc_reclaim(ngx_http_isonim_rpc_ctx(r));
+    }
     if (rc == NGX_ERROR) {
         /* The client went away: terminate; the pool cleanup releases the
          * Nim state. */
@@ -643,13 +695,48 @@ ngx_int_t
 ngx_http_isonim_send_body(ngx_http_request_t *r, const u_char *data,
     size_t len, ngx_flag_t flush, ngx_flag_t last)
 {
-    ngx_buf_t    *b;
-    ngx_chain_t   out;
-    ngx_int_t     rc;
+    ngx_buf_t                  *b;
+    ngx_chain_t                 out, *cl;
+    ngx_int_t                   rc;
+    ngx_http_isonim_rpc_ctx_t  *ctx;
+    u_char                     *p;
 
     if (len == 0 && !flush && !last) return NGX_OK;
 
-    if (len > 0) {
+    ctx = ngx_http_isonim_rpc_ctx(r);
+    if (len > 0 && ctx != NULL) {
+        /* An isonim_rpc response: the bytes outside the request pool,
+         * freed once written (ngx_http_isonim_rpc_reclaim). */
+        p = ngx_alloc(len, r->connection->log);
+        if (p == NULL) return NGX_ERROR;
+        if (ctx->out_free != NULL) {
+            cl = ctx->out_free;
+            ctx->out_free = cl->next;
+            b = cl->buf;
+        } else {
+            cl = ngx_alloc_chain_link(r->pool);
+            b = ngx_calloc_buf(r->pool);
+            if (cl == NULL || b == NULL) {
+                ngx_free(p);
+                return NGX_ERROR;
+            }
+            cl->buf = b;
+        }
+        ngx_memzero(b, sizeof(ngx_buf_t));
+        ngx_memcpy(p, data, len);
+        b->start = p;
+        b->pos = p;
+        b->last = p + len;
+        b->end = p + len;
+        b->temporary = 1;
+        b->tag = (ngx_buf_tag_t) &ngx_http_isonim_send_body;
+        cl->next = NULL;
+        if (ctx->out_busy_tail == NULL) {
+            ctx->out_busy_tail = &ctx->out_busy;
+        }
+        *ctx->out_busy_tail = cl;
+        ctx->out_busy_tail = &cl->next;
+    } else if (len > 0) {
         b = ngx_create_temp_buf(r->pool, len);
         if (b == NULL) return NGX_ERROR;
         b->last = ngx_cpymem(b->pos, data, len);
@@ -667,6 +754,9 @@ ngx_http_isonim_send_body(ngx_http_request_t *r, const u_char *data,
     out.buf = b;
     out.next = NULL;
     rc = ngx_http_output_filter(r, &out);
+    if (ctx != NULL) {
+        ngx_http_isonim_rpc_reclaim(ctx);
+    }
 
     if (rc != NGX_ERROR && !last) {
         ngx_http_isonim_rpc_hold(r);
@@ -824,6 +914,13 @@ ngx_http_isonim_rpc_cleanup(void *data)
     if (state != NULL) {
         nim_rpc_released(state);
     }
+    /* The request is over: the bytes nginx never wrote go with it. */
+    while (ctx->out_busy != NULL) {
+        ngx_free(ctx->out_busy->buf->start);
+        ctx->out_busy->buf->start = NULL;
+        ctx->out_busy = ctx->out_busy->next;
+    }
+    ctx->out_busy_tail = &ctx->out_busy;
 }
 
 /* Copies the request body (memory or temporary-file buffers) into one
@@ -985,6 +1082,7 @@ ngx_http_isonim_rpc_handler(ngx_http_request_t *r,
     ctx->kind = NGX_HTTP_ISONIM_CTX_RPC;
     ctx->request = r;
     ctx->body_limit = conf->rpc_max_body_size;
+    ctx->out_busy_tail = &ctx->out_busy;
     ngx_http_set_ctx(r, ctx, ngx_http_isonim_module);
 
     /* Temporary body files are removed with the request. */
