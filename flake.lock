@@ -60,7 +60,7 @@
       "locked": {
         "owner": "metacraft-labs",
         "repo": "isonim",
-        "rev": "fcdfcb2e11d4e3963010a00f9f8796f16bc6e581",
+        "rev": "11311004d0f031fb209f64c7fa835815add60cbc",
         "type": "github"
       },
       "original": {
@@ -74,7 +74,7 @@
       "locked": {
         "owner": "metacraft-labs",
         "repo": "nim-everywhere",
-        "rev": "95977e85e3aa9f3d8f54ecb42fdc9505ac3d3107",
+        "rev": "2a41b67a6c0d41cbb55359c702f300eb2696682f",
         "type": "github"
       },
       "original": {
