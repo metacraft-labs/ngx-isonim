@@ -6,7 +6,8 @@
 ##
 ## Covered here: the response of a server function and of an async app
 ## (status, headers, Content-Length body, finalization), failures (a
-## raising handler or server function, an unknown or non-async app), the
+## raising handler or server function, a server function writing to the
+## nil body writer, an unknown or non-async app), the
 ## timeout, a request released by nginx while its handler runs, and that a
 ## slow handler does not hold up another; and the streaming of async apps
 ## (IFP-M30): the commit on the first flush, the chunk and last-buffer
@@ -41,6 +42,18 @@ proc broken(): Future[int] {.server(auth = aPublic, csrf = csrfAnon).} =
 
 proc subscribe(email: string): Future[bool] {.action(auth = aPublic, csrf = csrfAnon, target = "/thanks").} =
   return true
+
+var registryWriterWasNil = false
+var misuseRuns = 0
+
+proc misuse(ctx: RequestContext; n: int): Future[int] {.server(auth = aPublic, csrf = csrfAnon).} =
+  ## Writes to the body writer the registry never gives a server function
+  ## (isonim-nginx.md: `ctx.bodyWriter` is nil for the server-function
+  ## registry).  IsoNim's `ResponseBody.write` raises `ValueError` on nil.
+  inc misuseRuns
+  registryWriterWasNil = ctx.bodyWriter.isNil
+  ctx.bodyWriter.write("oops")
+  return n
 
 proc post(path, body: string; contentType = "application/json";
           browser = true; httpMethod = "POST"): SsrRequest =
@@ -94,6 +107,28 @@ suite "isonim_rpc - server functions":
     check r.response.status == 500
     check r.response.body == """{"error":"internal"}"""
     check r.logged("server function raised KeyError: no such row")
+
+  test "the registry gives a server function no body writer":
+    # Pins the documented nil: `run` sets the writer for async apps only.
+    # A writer here would let a server function commit a response the
+    # registry then answers whole.
+    registryWriterWasNil = false
+    misuseRuns = 0
+    discard serveRpcRecorded(post(misuseUrl, """{"n": 1}"""))
+    check misuseRuns == 1                 # vacuity guard: the function ran
+    check registryWriterWasNil
+
+  test "a server function writing to the nil body writer is 500, and the process serves on":
+    misuseRuns = 0
+    let r = serveRpcRecorded(post(misuseUrl, """{"n": 1}"""))
+    check misuseRuns == 1
+    check r.finished and r.response.status == 500
+    check r.response.body == """{"error":"internal"}"""
+    check "oops" notin r.response.body
+    check r.logged("server function raised ValueError: write on a nil response body writer")
+    # The same process (the worker) answers the next request normally.
+    let next = serveRpcRecorded(post(addUrl, """{"a": 2, "b": 40}"""))
+    check next.response.status == 200 and next.response.body == "42"
 
   test "a no-JS form submission of an action is a bodiless 303":
     let r = serveRpcRecorded(post(subscribeUrl, "email=a%40b&_csrf=tok",

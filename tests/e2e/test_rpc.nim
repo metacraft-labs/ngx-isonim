@@ -12,7 +12,8 @@
 ## before the client has finished sending, after at most one read buffer
 ## past the limit); 405 and CSRF refusals; the
 ## request context (session, path, client address, CSRF verdict);
-## isonim_rpc_timeout (504); a client that goes away mid-handler; an
+## a server function writing to the nil `ctx.bodyWriter` (500, the same
+## worker serving on); isonim_rpc_timeout (504); a client that goes away mid-handler; an
 ## AsyncSocket request from a server function to this same nginx; an async
 ## app (isonim_rpc_app) on any method; and that a slow server function does
 ## not hold up the worker.
@@ -227,6 +228,20 @@ suite "isonim_rpc against real nginx":
     check r.status == "HTTP/1.1 500 Internal Server Error"
     check r.body == """{"error":"internal"}"""
     check "rpc_app.fails was called" in n.errorLogText
+
+  test "a server function writing to the nil ctx.bodyWriter is 500; the worker survives":
+    let before = n.workerPids
+    check before.len == 1                 # vacuity guard: one worker to watch
+    let r = n.call("writesBody", "{}")
+    check r.status == "HTTP/1.1 500 Internal Server Error"
+    check r.body == """{"error":"internal"}"""
+    check "rpc_app.writesBody wrote" notin r.body
+    # The same worker serves the next request: no respawn, no signal.
+    check n.call("sum", """{"a": 2, "b": 3}""").body == "5"
+    check n.workerPids == before
+    let log = n.errorLogText
+    check "server function raised ValueError: write on a nil response body writer" in log
+    check "exited on signal" notin log
 
   test "isonim_rpc_timeout: 504 after the timeout, logged":
     let t0 = getMonoTime()

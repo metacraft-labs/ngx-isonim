@@ -14,10 +14,13 @@
 ##   completes if the worker keeps serving while the socket waits (the
 ##   dispatcher's descriptor in the worker's event loop).
 ## * `fails`: raises.
+## * `writesBody`: writes to `ctx.bodyWriter`, which the registry leaves nil
+##   (a misuse); IsoNim's `ResponseBody.write` raises `ValueError` on nil,
+##   so the worker answers 500 instead of dying with SIGSEGV.
 ## * the async app `rpc_echo`: any method, the body echoed.
 
 import std/[asyncdispatch, asyncnet, json, strutils]
-import isonim/server/[pragma, rpc, context]
+import isonim/server/[pragma, rpc, context, response_body]
 import ../../../src/app_registry
 
 type Who* = object
@@ -68,6 +71,11 @@ proc selfFetch(port: int; path: string): Future[string]
 
 proc fails(): Future[int] {.server(auth = aPublic, csrf = csrfAnon).} =
   raise newException(ValueError, "rpc_app.fails was called")
+
+proc writesBody(ctx: RequestContext): Future[bool] {.server(auth = aPublic, csrf = csrfAnon).} =
+  let wasNil = ctx.bodyWriter.isNil
+  ctx.bodyWriter.write("rpc_app.writesBody wrote")
+  return wasNil   # not reached while the registry's writer is nil
 
 proc registerRpcApps*() =
   serverHooks.resolveSession = proc(req: SsrRequest): Future[Session] {.async.} =
