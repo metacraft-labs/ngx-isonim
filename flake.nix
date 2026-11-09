@@ -239,12 +239,18 @@
             pkgs.zlib
           ];
 
+          # The banner goes to stderr: `nix develop --command <cmd>` runs this
+          # hook too, so on stdout it would precede <cmd>'s own output, and
+          # .github/workflows/benchmark.yml redirects that output into the
+          # JSON files github-action-benchmark parses.
           shellHook = ''
             ${ownRepoOnly installGitHooks}
-            echo "ngx-isonim dev shell"
-            echo "  nim $(nim --version 2>&1 | head -1)"
-            echo "  nginx $(nginx -v 2>&1)"
-            echo "  nginx headers: $NGX_DEV_HEADERS"
+            {
+              echo "ngx-isonim dev shell"
+              echo "  nim $(nim --version 2>&1 | head -1)"
+              echo "  nginx $(nginx -v 2>&1)"
+              echo "  nginx headers: $NGX_DEV_HEADERS"
+            } >&2
           '';
         };
 
