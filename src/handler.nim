@@ -184,7 +184,8 @@ else:
     ## logged: its apps are only partly registered.
 
   proc nimModuleInit*() {.exportc: "nim_module_init", cdecl.} =
-    ## Called once per worker, from C, before the first request.
+    ## Called once per worker, from C, when the worker starts (its
+    ## init_process), before it takes a connection.
     NimMain()
     # Nothing may escape into nginx's C frames: an app's registerApps()
     # that raises (ShmZoneError, ...) fails this worker's requests instead.
@@ -194,6 +195,9 @@ else:
       initFailure = "registering the applications failed: " & $e.name &
         ": " & e.msg
     startAsyncLoop()
+    # Run what the registration queued and arm the timer for what waits, so
+    # a background task an app started runs now, not at the first request.
+    pump()
 
   proc logTo(r: NgxHttpRequest; level: NgxUint; msg: string) =
     if msg.len > 0:

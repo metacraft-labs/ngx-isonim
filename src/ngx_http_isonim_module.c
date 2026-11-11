@@ -1878,7 +1878,16 @@ ngx_http_isonim_boundary_workers(void)
 }
 
 /* init_process: a worker (also one respawned after a crash) starts with
- * no channels; the slot's count left by a dead predecessor is reset. */
+ * no channels; the slot's count left by a dead predecessor is reset.
+ *
+ * Then the Nim runtime, the applications and the event-loop hookup start
+ * (nim_module_init), in the worker itself and before it takes its first
+ * connection: what an application starts while it registers (a background
+ * task on the worker's loop, such as a key refresher) runs from the
+ * worker's start, not from its first request.  Only a worker (or the
+ * single process of `master_process off`) serves requests; a cache
+ * manager or loader starts no Nim.  The calls on the request paths stay,
+ * for a process that reaches them without having passed here. */
 static ngx_int_t
 ngx_http_isonim_init_process(ngx_cycle_t *cycle)
 {
@@ -1886,6 +1895,11 @@ ngx_http_isonim_init_process(ngx_cycle_t *cycle)
 
     if (slots != NULL && ngx_worker < NGX_HTTP_ISONIM_BOUNDARY_MAX_SLOTS) {
         slots[ngx_worker] = 0;
+    }
+    if (ngx_process == NGX_PROCESS_WORKER
+        || ngx_process == NGX_PROCESS_SINGLE)
+    {
+        ngx_http_isonim_init_nim();
     }
     return NGX_OK;
 }
