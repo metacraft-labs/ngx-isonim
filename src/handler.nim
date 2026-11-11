@@ -194,6 +194,10 @@ else:
     except Exception as e:
       initFailure = "registering the applications failed: " & $e.name &
         ": " & e.msg
+      # Logged once now, at the worker's start, as well as with each
+      # request it then refuses.
+      ngx_http_isonim_log_cycle(NGX_LOG_ERR, unsafeAddr initFailure[0],
+                                csize_t(initFailure.len))
     startAsyncLoop()
     # Run what the registration queued and arm the timer for what waits, so
     # a background task an app started runs now, not at the first request.

@@ -89,12 +89,12 @@ suite "worker start":
 
   test "mutant: the runtime started lazily, on the first request":
     let m = buildMutant("lazy-start", "src/ngx_http_isonim_module.c",
-      """    if (ngx_process == NGX_PROCESS_WORKER
-        || ngx_process == NGX_PROCESS_SINGLE)
-    {
-        ngx_http_isonim_init_nim();
+      """        slots[ngx_worker] = 0;
     }
-    return NGX_OK;""", "    return NGX_OK;")
+    ngx_http_isonim_init_nim();
+    return NGX_OK;""", """        slots[ngx_worker] = 0;
+    }
+    return NGX_OK;""")
     let r = runStart(m)
     check r.pids.len == workers
     check r.started.len == 0            # the assertion above fails

@@ -108,10 +108,12 @@ proc boundaryServer(bport: int; extra = ""; http2 = true;
   "  }\n"
 
 proc startNode(module: string; extra = ""; http2 = true;
-               nodeCert = pki.node): Node =
+               nodeCert = pki.node; httpExtra = ""): Node =
+  ## `httpExtra` goes into the http block (e.g. a `proxy_cache_path`, whose
+  ## cache manager and loader processes nginx starts beside the workers).
   result.bport = freePort()
   result.nginx = startNginx(module, appLocations, workerProcesses = workers,
-    httpConf = "  keepalive_requests 1000000;\n" &
+    httpConf = "  keepalive_requests 1000000;\n" & httpExtra &
       boundaryServer(result.bport, extra, http2, nodeCert = nodeCert),
     listenOptions = "reuseport")
 
