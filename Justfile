@@ -213,7 +213,10 @@ clean:
     rm -f tests/test_shm_table tests/test_boundary
     rm -rf tests/nimcache benchmarks/nimcache
 
-# Entering the dev shell from another git repository must write nothing there.
-# Runs `nix develop`, so it is not part of the in-shell test recipes.
+# Entering the dev shell from another git repository must write nothing there,
+# and entering it here keeps Reprobuild's managed hooks in their slots (needs
+# `repro` on PATH). Runs `nix develop`, so it is not part of the in-shell test
+# recipes.
 test-dev-shell:
     bash tests/test_dev_shell_writes_nothing_elsewhere.sh
+    bash tests/test_dev_shell_keeps_repro_hooks.sh
