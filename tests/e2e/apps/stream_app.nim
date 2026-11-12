@@ -17,6 +17,13 @@
 ## * `stream_big`: `size` bytes of `patternByte` in flushed parts of `part`
 ##   bytes, pausing `pause_ms` between parts (a producer that takes its
 ##   time, so that clients disconnect while the handler is still running).
+##   With `max_unsent` > 0 it also honours backpressure the way
+##   spec/isonim-nginx.md ("Backpressure") tells a handler to: before each
+##   part it waits, polling every millisecond, until the body writer's
+##   `unsentBytes` is at most `max_unsent`.  Without it, a producer faster
+##   than its client makes the response's memory whatever it has written
+##   and the client has not read yet, which is correct but measures the
+##   producer's speed rather than the module.
 ## * `stream_stats`: how many isonim_rpc requests this worker has released,
 ##   and what the last `stream_unsent` observed.
 ## * `stream_unsent`: writes `part`-byte parts, each flushed, until the body
@@ -79,13 +86,18 @@ proc registerStreamApps*() =
     let size = parseInt(ctx.request.queryParam("size", "0"))
     let part = max(1, parseInt(ctx.request.queryParam("part", "8192")))
     let pauseMs = parseInt(ctx.request.queryParam("pause_ms", "0"))
+    let maxUnsent = parseInt(ctx.request.queryParam("max_unsent", "0"))
     var buf = newString(part)
     var written = 0
     while written < size:
+      if maxUnsent > 0:
+        # The module's write handler sends what nginx holds as the socket
+        # drains, between turns of this loop; unsentBytes falls with it.
+        while body.unsentBytes > maxUnsent:
+          await sleepAsync(1)
       let n = min(part, size - written)
       buf.setLen(n)
-      for i in 0 ..< n:
-        buf[i] = patternByte(written + i)
+      patternFill(buf, written)
       body.write(buf)
       body.flush()
       written += n
@@ -103,8 +115,7 @@ proc registerStreamApps*() =
     var written = 0
     var unsent = 0
     while written < limit:
-      for i in 0 ..< part:
-        buf[i] = patternByte(written + i)
+      patternFill(buf, written)
       body.write(buf)
       body.flush()
       written += part
