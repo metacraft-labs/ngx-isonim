@@ -86,16 +86,20 @@ fi
 
 # --- nginx, no handler chosen ---------------------------------------------
 
-PORT=0
-for _ in $(seq 1 50); do
-  candidate=$((20000 + RANDOM % 30000))
-  if ! port_open "${candidate}"; then
-    PORT=${candidate}
-    break
-  fi
-done
+# The connect probe only skips the ports that are obviously taken: a port
+# nobody listens on can still be bound by another socket, so a start that
+# fails with EADDRINUSE is retried on another port.
 mkdir -p "${WORK}"/{client_body,proxy,fastcgi,uwsgi,scgi}
-cat >"${WORK}/nginx.conf" <<EOF
+for attempt in $(seq 1 10); do
+  PORT=0
+  for _ in $(seq 1 50); do
+    candidate=$((20000 + RANDOM % 30000))
+    if ! port_open "${candidate}"; then
+      PORT=${candidate}
+      break
+    fi
+  done
+  cat >"${WORK}/nginx.conf" <<EOF
 load_module ${MODULE};
 worker_processes 1;
 error_log ${WORK}/error.log info;
@@ -115,12 +119,20 @@ http {
   }
 }
 EOF
-if ! nginx -c "${WORK}/nginx.conf" -p "${WORK}" -e "${WORK}/error.log" \
-  </dev/null >"${WORK}/start.log" 2>&1; then
+  rm -f "${WORK}/error.log"
+  if nginx -c "${WORK}/nginx.conf" -p "${WORK}" -e "${WORK}/error.log" \
+    </dev/null >"${WORK}/start.log" 2>&1; then
+    break
+  fi
+  if [ "${attempt}" -lt 10 ] &&
+    grep -qF "Address already in use" "${WORK}/start.log" "${WORK}/error.log" 2>/dev/null; then
+    echo "  port ${PORT} is in use; retrying on another"
+    continue
+  fi
   cat "${WORK}/start.log" "${WORK}/error.log"
   echo "FATAL: nginx did not start"
   exit 1
-fi
+done
 if ! wait_for 10 port_open "${PORT}"; then
   echo "FATAL: nginx did not open port ${PORT}"
   exit 1

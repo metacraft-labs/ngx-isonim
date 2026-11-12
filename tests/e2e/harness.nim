@@ -135,6 +135,12 @@ proc freePort*(): int =
   result = int(s.getLocalAddr()[1])
   s.close()
 
+proc addressInUse*(nginxOutput: string; port: int): bool =
+  ## Whether nginx failed to start because 127.0.0.1:`port` was taken
+  ## (its `bind() to 127.0.0.1:<port> failed (98: Address already in use)`).
+  "bind() to 127.0.0.1:" & $port & " failed (98: Address already in use)" in
+    nginxOutput
+
 proc portOpen(port: int): bool =
   let s = newSocket()
   try:
@@ -203,7 +209,6 @@ proc startNginx*(module: string; locations: string;
   ## `mainConf` into the main context (e.g. `env` lines), `listenOptions`
   ## after the listen address (e.g. `reuseport`).
   result.prefix = newPrefix()
-  result.port = freePort()
   result.errorLog = result.prefix / "error.log"
   result.pidFile = result.prefix / "nginx.pid"
   result.module = module
@@ -212,20 +217,32 @@ proc startNginx*(module: string; locations: string;
   result.httpConf = httpConf
   result.mainConf = mainConf
   result.listenOptions = listenOptions
-  result.writeConf()
   let conf = result.prefix / "nginx.conf"
   # nginx daemonizes, and its master would keep any pipe it inherits open
   # (osproc's pipes leak into grandchildren), so a reader waiting for EOF
   # would wait for nginx to exit.  Start it through system() with its
   # output in a file instead.
   let startLog = result.prefix / "start.log"
-  let code = execShellCmd("nginx -c " & quoteShell(conf) &
-    " -p " & quoteShell(result.prefix) & " -e " & quoteShell(result.errorLog) &
-    " < /dev/null > " & quoteShell(startLog) & " 2>&1")
-  if code != 0:
-    raise newException(OSError, "nginx failed to start:\n" &
-      readFile(startLog) &
-      (if fileExists(result.errorLog): readFile(result.errorLog) else: ""))
+  # `freePort` closes its socket before nginx binds the port, so another
+  # socket (another process's outgoing connection, say) can take it in
+  # between: a start that fails with EADDRINUSE on that port is retried on
+  # a fresh one.  A collision on a port the caller put in `httpConf` is
+  # raised at once (`addressInUse` lets the caller retry with another).
+  const attempts = 10
+  for attempt in 1 .. attempts:
+    result.port = freePort()
+    result.writeConf()
+    removeFile(result.errorLog)
+    let code = execShellCmd("nginx -c " & quoteShell(conf) &
+      " -p " & quoteShell(result.prefix) & " -e " & quoteShell(result.errorLog) &
+      " < /dev/null > " & quoteShell(startLog) & " 2>&1")
+    if code == 0:
+      break
+    let output = readFile(startLog) &
+      (if fileExists(result.errorLog): readFile(result.errorLog) else: "")
+    if attempt < attempts and output.addressInUse(result.port):
+      continue
+    raise newException(OSError, "nginx failed to start:\n" & output)
   let deadline = getMonoTime() + initDuration(seconds = 10)
   while not portOpen(result.port):
     if getMonoTime() > deadline:
