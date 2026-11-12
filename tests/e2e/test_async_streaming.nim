@@ -33,10 +33,17 @@
 ##   byte; the release callback ran once for every request
 ##   (`rpcRequestsReleased`, read through `stream_stats`); the worker's
 ##   descriptor count returns to its baseline; every fast request's first
-##   byte arrived and was timed.  The fast client's time to first byte,
-##   measured on the CLIENT side (monotonic clock, from before `connect`
-##   to the first response byte read), stays under 20 ms while the slow
-##   clients stream.  It is timed on the client because nginx's
+##   byte arrived and was timed; every slow and aborting client was
+##   streaming before the fast client started.  The fast client's time to
+##   first byte, measured on the CLIENT side (monotonic clock, from before
+##   `connect` to the first response byte read), stays under 20 ms while
+##   the slow clients stream.  The fast client starts only once each of
+##   the 70 requests has received its first body byte: the bound is about a
+##   request arriving while the slow clients are being served, not about
+##   how fast one worker starts 70 handlers at once (a burst no spec bounds;
+##   under the AddressSanitizer debug build of test_rpc_asan.sh, starting
+##   them took 20-70 ms, nearly all of it ASan's interception of the debug
+##   runtime's thread-local accesses).  It is timed on the client because nginx's
 ##   `$request_time` starts after the request has been read and uses
 ##   nginx's cached clock: a worker whose event loop is blocked has not
 ##   read the request yet, so `$request_time` cannot see the wait (a
@@ -56,7 +63,9 @@
 ##   leaves the descriptor count above its baseline; a producer that
 ##   blocks the worker's event loop (`stream_big` calling `os.sleep(15)`
 ##   after each flush) makes the fast client's measured wait exceed the
-##   bound by `SensitivityFactor` or more.  That last check is the
+##   bound by `SensitivityFactor` or more, with the fast client started the
+##   same way (the mutant blocks while it streams, which is when the fast
+##   client runs).  That last check is the
 ##   measurement's own vacuity guard and is NOT load-gated: load only
 ##   lengthens the mutant's wait, so it holds on a loaded host too, and it
 ##   fails whenever the timing cannot see a blocked event loop (as
@@ -392,6 +401,8 @@ type
     aborted: int           ## aborting clients that got their 32 KiB
     fastOk: int
     fastClientMs: seq[float]   ## client-side time to first byte, per request
+    streamingBeforeFast: int   ## slow and aborting clients streaming when
+                               ## the fast client started
     fastServerMs: seq[float]   ## nginx's $request_time (a log line only)
     baselineFds: int
     fdsAfter: int
@@ -405,18 +416,29 @@ proc smallRcvbuf(s: AsyncSocket) =
   discard posix.setsockopt(SocketHandle(s.getFd), SOL_SOCKET, SO_RCVBUF,
                            addr size, SockLen(sizeof(size)))
 
-proc slowClient(port: int; bytesPerSec: int; deadline: MonoTime):
-    Future[ClientResult] {.async.} =
+proc hasBodyByte(raw: string): bool =
+  ## The response's head has arrived, and at least one byte after it.
+  let sep = raw.find("\r\n\r\n")
+  sep >= 0 and raw.len > sep + 4
+
+proc slowClient(port: int; bytesPerSec: int; deadline: MonoTime;
+                streaming: ref int): Future[ClientResult] {.async.} =
+  ## Reads the big body at `bytesPerSec`; counts itself in `streaming`
+  ## once its first body byte arrived.
   let s = newAsyncSocket(buffered = false)
   s.smallRcvbuf()
   await s.connect("127.0.0.1", Port(port))
   await s.send(request(bigPath))
   var raw = ""
+  var counted = false
   let t0 = getMonoTime()
   while getMonoTime() < deadline:
     let got = await s.recv(1024)
     if got.len == 0: break
     raw.add got
+    if not counted and raw.hasBodyByte:
+      counted = true
+      inc streaming[]
     # Hold the pace: no more than bytesPerSec on average.
     let due = int(raw.len * 1000 div bytesPerSec)
     let elapsed = int((getMonoTime() - t0).inMilliseconds)
@@ -432,18 +454,26 @@ proc slowClient(port: int; bytesPerSec: int; deadline: MonoTime):
     result.terminated = d.terminated
     result.invalid = d.invalid
 
-proc abortingClient(port: int; afterBytes: int; deadline: MonoTime):
-    Future[bool] {.async.} =
-  ## Reads `afterBytes` of the response, then closes the connection.
+proc abortingClient(port: int; afterBytes: int; deadline: MonoTime;
+                    streaming: ref int): Future[bool] {.async.} =
+  ## Reads `afterBytes` of the response, then closes the connection; counts
+  ## itself in `streaming` once its first body byte arrived.
   let s = newAsyncSocket(buffered = false)
   s.smallRcvbuf()
   await s.connect("127.0.0.1", Port(port))
   await s.send(request(bigPath))
   var got = 0
+  var head = ""
+  var counted = false
   while got < afterBytes and getMonoTime() < deadline:
     let part = await s.recv(4096)
     if part.len == 0: break
     got += part.len
+    if not counted:
+      head.add part
+      if head.hasBodyByte:
+        counted = true
+        inc streaming[]
   s.close()
   got >= afterBytes
 
@@ -484,7 +514,14 @@ proc fetchTimed(port: int; path: string): Future[(string, float)] {.async.} =
   s.close()
   (raw, ms)
 
-proc fastClient(port: int; count: int; run: ptr BackpressureRun) {.async.} =
+proc fastClient(port: int; count: int; run: ptr BackpressureRun;
+                 streaming: ref int; streamers: int; deadline: MonoTime) {.async.} =
+  ## Starts once all `streamers` slow and aborting clients are streaming
+  ## (or at `deadline`, which only turns a hang into a failure: the count
+  ## is checked), then times `count` requests 500 ms apart.
+  while streaming[] < streamers and getMonoTime() < deadline:
+    await sleepAsync(1)
+  run.streamingBeforeFast = streaming[]
   for i in 0 ..< count:
     let (raw, ms) = await fetchTimed(port, "/fast/f" & $i)
     if raw.len > 0:
@@ -512,12 +549,15 @@ proc backpressureScenario(n: Nginx; slowClients, abortingClients: int;
   let deadline = getMonoTime() + initDuration(seconds = 60)
   var slow: seq[Future[ClientResult]]
   var aborting: seq[Future[bool]]
+  let streaming = new int
   for i in 0 ..< slowClients:
-    slow.add slowClient(n.port, 16 * 1024, deadline)
+    slow.add slowClient(n.port, 16 * 1024, deadline, streaming)
   for i in 0 ..< abortingClients:
-    aborting.add abortingClient(n.port, 32 * 1024, deadline)
+    aborting.add abortingClient(n.port, 32 * 1024, deadline, streaming)
   var run = addr result
-  let fast = fastClient(n.port, fastRequests, run)
+  let fast = fastClient(n.port, fastRequests, run, streaming,
+                        slowClients + abortingClients,
+                        getMonoTime() + initDuration(seconds = 20))
   for f in slow:
     result.slow.add waitFor f
   for f in aborting:
@@ -551,7 +591,8 @@ proc summary(r: BackpressureRun): string =
   for c in r.slow:
     if c.terminated and not c.invalid and c.body.len == BigSize: inc whole
   "slow whole " & $whole & "/" & $r.slow.len & ", aborted " & $r.aborted &
-    ", fast ok " & $r.fastOk & ", fast client TTFB max " &
+    ", fast ok " & $r.fastOk & " (started with " & $r.streamingBeforeFast &
+    " streaming), fast client TTFB max " &
     (if r.fastClientMs.len > 0: $max(r.fastClientMs) & " ms" else: "-") &
     " (nginx $request_time max " &
     (if r.fastServerMs.len > 0: $max(r.fastServerMs) & " ms" else: "-") & ")" &
@@ -589,6 +630,7 @@ suite "test_async_streaming_backpressure_and_abort":
     check r.releasedSeen == r.releasedExpected
     check r.fdsAtBaseline
     check r.fastClientMs.len == 20
+    check r.streamingBeforeFast == 70
     let worst = if r.fastClientMs.len > 0: max(r.fastClientMs) else: Inf
     let load = max(r.loadBefore, r.loadAfter)
     if load > MaxLoadPerCpu:
@@ -656,6 +698,7 @@ suite "test_async_streaming_backpressure_and_abort":
     m.stop()
     echo "    mutant: ", r.summary
     check r.fastClientMs.len == 4
+    check r.streamingBeforeFast == 15   # measured under the same start
     let worst = if r.fastClientMs.len > 0: max(r.fastClientMs) else: 0.0
     check worst > SensitivityFactor * TtfbBoundMs
 
