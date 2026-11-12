@@ -32,6 +32,11 @@
 ##   in every slot, which the workers' own pools confirm; killing one
 ##   worker makes the peer reopen until it is covered again.  Mutant: the
 ##   handshake reports the node's total instead of the slot's count.
+## * test_boundary_slot_kept_by_cache_helpers: with a `proxy_cache_path`
+##   (nginx then runs a cache manager and loader beside the workers, each
+##   running init_process with ngx_worker 0), the cache manager killed and
+##   respawned leaves every slot's counts in agreement, slot 0's included.
+##   Mutant: every process resets the slot of its ngx_worker.
 ## * test_boundary_no_channel_fails_fast: with no peer, `boundaryCall` fails
 ##   with bcNoChannel before it returns, no file appears under the nginx
 ##   prefix (its temp paths included), and a peer that connects later
@@ -367,6 +372,78 @@ ngx_http_isonim_boundary_channels_in_slot(void)
     echo "    mutant: ", c.failures.len, " failures, e.g. ",
       (if c.failures.len > 0: c.failures[0] else: "")
     check c.failures.anyIt("channel(s)" in it)
+
+# ---------------------------------------------------------------------------
+# test_boundary_slot_kept_by_cache_helpers
+# ---------------------------------------------------------------------------
+#
+# With a `proxy_cache_path`, nginx runs a cache manager (and a cache loader)
+# beside the workers; each runs the modules' init_process with ngx_worker 0.
+# Only a worker may reset its slot's count there: covered slots, then the
+# cache manager killed (our master's child, named by its title) and
+# respawned by our master, then every slot's counts must still agree, slot
+# 0's node count included.
+
+proc cacheManagers(n: Node): seq[int] =
+  ## Our master's children whose title names the cache manager.
+  for pid in n.nginx.workerPids:
+    var title = ""
+    try: title = readFile("/proc/" & $pid & "/cmdline")
+    except IOError, OSError: discard
+    if "cache manager" in title: result.add pid
+
+proc helperRestart(module: string): seq[string] =
+  let dir = getTempDir() / ("ngx-isonim-cache-" & $getCurrentProcessId() & "-" & $getMonoTime().ticks)
+  createDir(dir)
+  defer: removeDir(dir)
+  let n = startNode(module, extra = "    isonim_boundary_min_channels 2;\n",
+    httpExtra = "  proxy_cache_path " & dir & " keys_zone=isonim_test_cache:1m;\n")
+  defer: n.stop()
+  let f = newFleet(n)
+  waitFor f.cover()
+  var statuses = waitFor waitLive(n, f)
+  result.add agreement(f, statuses, "covered")
+  let managers = n.cacheManagers
+  if managers.len != 1:
+    result.add "vacuity: " & $managers.len & " cache manager(s) among our master's children"
+    return
+  discard posix.kill(Pid(managers[0]), SIGKILL)
+  let deadline = getMonoTime() + initDuration(seconds = 10)
+  while getMonoTime() < deadline and (n.cacheManagers.len != 1 or managers[0] in n.cacheManagers):
+    sleep(20)
+  if n.cacheManagers.len != 1 or managers[0] in n.cacheManagers:
+    result.add "vacuity: our master did not respawn the cache manager"
+    return
+  statuses = waitFor waitLive(n, f)
+  result.add agreement(f, statuses, "after the cache manager's respawn")
+  waitFor f.closeAll()
+
+suite "test_boundary_slot_kept_by_cache_helpers":
+  test "a cache manager's start leaves worker 0's count alone":
+    let failures = helperRestart(testModule())
+    if failures.len > 0:
+      echo "    ", failures.join("\n    ")
+    check failures.len == 0
+
+  test "mutant: every process resets the slot of its ngx_worker":
+    let module = mutant("helper-resets-slot", "src/ngx_http_isonim_module.c",
+      """    if (ngx_process != NGX_PROCESS_WORKER
+        && ngx_process != NGX_PROCESS_SINGLE)
+    {
+        return NGX_OK;
+    }""",
+      """    if (ngx_process != NGX_PROCESS_WORKER
+        && ngx_process != NGX_PROCESS_SINGLE)
+    {
+        /* MUTANT: a helper resets the slot of its ngx_worker (0). */
+        if (slots != NULL) {
+            slots[ngx_worker] = 0;
+        }
+        return NGX_OK;
+    }""")
+    let failures = helperRestart(module)
+    echo "    mutant: ", failures.len, " failures, e.g. ", (if failures.len > 0: failures[0] else: "")
+    check failures.anyIt("after the cache manager's respawn" in it and "node counts" in it)
 
 # ---------------------------------------------------------------------------
 # test_boundary_no_channel_fails_fast

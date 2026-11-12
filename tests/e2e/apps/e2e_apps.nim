@@ -22,6 +22,8 @@
 ##   (tests/integration/t_boundary_channel.nim).
 ## * the streaming async apps `stream_*` of stream_app.nim
 ##   (test_async_streaming.nim).
+## * the background task and the app `start_test` of start_app.nim
+##   (test_worker_start.nim).
 
 import std/[json, base64, strutils, monotimes, times]
 import ../../../src/app_registry
@@ -32,6 +34,7 @@ import rpc_app
 import shm_app
 import boundary_app
 import stream_app
+import start_app
 
 proc echoJson(req: SsrRequest): string =
   ## The request as the renderer saw it.
@@ -100,6 +103,7 @@ proc registerE2eApps*() =
   registerShmApps()
   registerBoundaryApps()
   registerStreamApps()
+  registerStartApps()
 
   registerApp("echo", proc(req: SsrRequest; resp: SsrResponse): string =
     shape(req, resp)

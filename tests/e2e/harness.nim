@@ -165,7 +165,7 @@ proc childPids*(pid: int): seq[int] =
 
 proc writeConf(n: Nginx) =
   writeFile(n.prefix / "nginx.conf", """
-load_module $1;
+$1
 worker_processes $2;
 error_log $3 info;
 pid $4;
@@ -184,7 +184,7 @@ $8
 $7
   }
 }
-""" % [n.module, $n.workerProcesses, n.errorLog, n.pidFile,
+""" % [(if n.module.len > 0: "load_module " & n.module & ";" else: "# no module"), $n.workerProcesses, n.errorLog, n.pidFile,
        n.prefix, $n.port, n.locations, n.httpConf, n.mainConf,
        (if n.listenOptions.len > 0: " " & n.listenOptions else: "")])
 
@@ -240,7 +240,9 @@ proc startNginx*(module: string; locations: string;
       pid = parseInt(readFile(result.pidFile).strip())
     except IOError, ValueError:
       discard
-    if pid > 0 and childPids(pid).len >= workerProcesses:
+    # `master_process off`: the one process serves, there are no workers.
+    let single = "master_process off" in mainConf
+    if pid > 0 and (single or childPids(pid).len >= workerProcesses):
       break
     if getMonoTime() > deadline:
       raise newException(OSError, "nginx wrote no pid file, or started " &

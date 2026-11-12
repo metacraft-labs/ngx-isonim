@@ -62,7 +62,7 @@ test-e2e: build-e2e
     set -euo pipefail
     export NGX_ISONIM_E2E_MODULE="$PWD/build/e2e/release/ngx_http_isonim_module.so"
     bash tests/e2e/test_e2e.sh
-    for t in test_request_context test_csp_nonce test_max_buffer_size test_rpc test_async_streaming test_long_stream test_shm_zone; do
+    for t in test_request_context test_csp_nonce test_max_buffer_size test_rpc test_async_streaming test_long_stream test_shm_zone test_worker_start test_single_process; do
       nim c -r --hints:off -o:build/e2e/$t tests/e2e/$t.nim
     done
     nim c -r --hints:off -o:build/e2e/t_boundary_channel tests/integration/t_boundary_channel.nim
@@ -213,7 +213,10 @@ clean:
     rm -f tests/test_shm_table tests/test_boundary
     rm -rf tests/nimcache benchmarks/nimcache
 
-# Entering the dev shell from another git repository must write nothing there.
-# Runs `nix develop`, so it is not part of the in-shell test recipes.
+# Entering the dev shell from another git repository must write nothing there,
+# and entering it here keeps Reprobuild's managed hooks in their slots (needs
+# `repro` on PATH). Runs `nix develop`, so it is not part of the in-shell test
+# recipes.
 test-dev-shell:
     bash tests/test_dev_shell_writes_nothing_elsewhere.sh
+    bash tests/test_dev_shell_keeps_repro_hooks.sh

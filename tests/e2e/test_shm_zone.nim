@@ -10,7 +10,8 @@
 ##   worker is read, with its version, by every worker; a key never stored
 ##   is absent in every worker; an app that binds an undeclared zone gets
 ##   500 with the zone named in the error log (and so does every request of
-##   a worker whose registration binds one).
+##   a worker whose registration binds one, whose failure each worker also
+##   logs when it starts, before any request).
 ## * test_shm_compare_and_set_under_contention: 64 concurrent clients
 ##   increment one value 10,000 times by read and putIf, retrying on
 ##   conflict; 200 concurrent incr calls against high 50.
@@ -83,6 +84,17 @@ type
     sock: Socket
     port: int
     open: bool
+
+proc startFailuresLogged(n: Nginx; deadlineMs = 10_000): int =
+  ## How many times the error log says a worker's registration failed, once
+  ## that count reaches `workers` or the deadline passes (no request sent).
+  let line = "registering the applications failed: ShmZoneError: shared-memory zone " &
+             "\"registration_zone\" is not declared"
+  let deadline = getMonoTime() + initDuration(milliseconds = deadlineMs)
+  while true:
+    result = n.errorLogText.count(line)
+    if result >= workers or getMonoTime() > deadline: return
+    sleep(20)
 
 proc toReply(status: int; body: string): Reply =
   result = Reply(status: status, body: body)
@@ -259,10 +271,21 @@ suite "test_shm_zone_is_shared_by_every_worker":
     let n = startShm(module, sharingConf,
       mainConf = "env SHM_TEST_BIND_AT_REGISTRATION=registration_zone;")
     defer: n.stop()
+    # Each worker logs the failure when it starts, before any request.
+    check startFailuresLogged(n) == workers
     for i in 0 ..< 12:
       check oneShot(n.port, "GET", "/shm/pid").status == 500
     check n.errorLogText.contains("registering the applications failed: " &
       "ShmZoneError: shared-memory zone \"registration_zone\" is not declared")
+
+  test "mutant: the registration failure not logged at the worker's start":
+    let module = mutant("no-start-log", "src/handler.nim",
+      """      ngx_http_isonim_log_cycle(NGX_LOG_ERR, unsafeAddr initFailure[0],
+                                csize_t(initFailure.len))""", "      discard")
+    let n = startShm(module, sharingConf,
+      mainConf = "env SHM_TEST_BIND_AT_REGISTRATION=registration_zone;")
+    defer: n.stop()
+    check startFailuresLogged(n, deadlineMs = 2000) == 0     # the assertion above fails
 
   test "mutant: a per-process table instead of the zone":
     let module = mutant("per-process-table", "src/ngx_http_isonim_module.c",

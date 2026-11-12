@@ -1363,6 +1363,26 @@ ngx_http_isonim_shm_release_old(ngx_cycle_t *old_cycle,
     }
 }
 
+/* The single process of `master_process off` (set by init_process).  On
+ * SIGHUP nginx reruns only ngx_init_cycle in that process; the modules'
+ * init_process, the event module's included (which puts the listening
+ * sockets in the event loop), runs once, when the process starts (nginx
+ * 1.28.3, src/os/unix/ngx_process_cycle.c, ngx_single_process_cycle: lines
+ * 289 and 317).  Measured with nginx 1.28.3 and no module loaded: after the
+ * reconfiguration a request gets no HTTP response.  The module says so,
+ * once when the process starts, and again when a reconfiguration runs
+ * (init_module is called for every cycle). */
+static ngx_flag_t  ngx_http_isonim_single_running;
+
+#define NGX_HTTP_ISONIM_SINGLE_WARNING                                        \
+    "isonim: master_process is off: nginx stops serving requests "            \
+    "after a SIGHUP reconfiguration in this mode; restart nginx to "          \
+    "apply a new configuration"
+
+#define NGX_HTTP_ISONIM_SINGLE_RELOAD_ERROR                                   \
+    "isonim: SIGHUP reconfiguration with master_process off: nginx "          \
+    "does not serve requests after it in this mode; restart nginx"
+
 /* init_module: runs in the master once the new cycle's shared memory is
  * set up and its listening sockets are open, just before nginx frees the
  * old cycle's segments that the new one does not reuse.  It runs only when
@@ -1382,13 +1402,25 @@ ngx_http_isonim_shm_release_old(ngx_cycle_t *old_cycle,
  *     the old one, and nginx frees an old zone marked noreuse even when the
  *     new configuration reuses it.  (Clearing it in the zone's init
  *     callback instead would keep a failed reload from freeing the fresh
- *     segment.) */
+ *     segment.)
+ *
+ * In the single process of `master_process off`, a reconfiguration also
+ * runs init_module, in that process: it logs the reconfiguration error
+ * (NGX_HTTP_ISONIM_SINGLE_RELOAD_ERROR; see
+ * ngx_http_isonim_single_running). */
 static ngx_int_t
 ngx_http_isonim_init_module(ngx_cycle_t *cycle)
 {
     ngx_uint_t        i;
     ngx_list_part_t  *part;
     ngx_shm_zone_t   *shm_zone;
+
+    if (ngx_http_isonim_single_running) {
+        /* A reconfiguration of the running single process (see
+         * ngx_http_isonim_single_running). */
+        ngx_log_error(NGX_LOG_ERR, cycle->log, 0,
+                      NGX_HTTP_ISONIM_SINGLE_RELOAD_ERROR);
+    }
 
     part = &cycle->shared_memory.part;
     shm_zone = part->elts;
@@ -1878,15 +1910,38 @@ ngx_http_isonim_boundary_workers(void)
 }
 
 /* init_process: a worker (also one respawned after a crash) starts with
- * no channels; the slot's count left by a dead predecessor is reset. */
+ * no channels; the slot's count left by a dead predecessor is reset.  Only
+ * a worker (or the single process) owns a slot: a cache manager or loader
+ * also runs init_process, with ngx_worker 0, and must leave worker 0's
+ * count alone.
+ *
+ * Then the Nim runtime, the applications and the event-loop hookup start
+ * (nim_module_init), in the worker itself and before it takes its first
+ * connection: what an application starts while it registers (a background
+ * task on the worker's loop, such as a key refresher) runs from the
+ * worker's start, not from its first request.  Only a worker (or the
+ * single process of `master_process off`) serves requests; a cache
+ * manager or loader starts no Nim.  The calls on the request paths stay,
+ * for a process that reaches them without having passed here. */
 static ngx_int_t
 ngx_http_isonim_init_process(ngx_cycle_t *cycle)
 {
     ngx_atomic_t  *slots = ngx_http_isonim_boundary_slots();
 
+    if (ngx_process != NGX_PROCESS_WORKER
+        && ngx_process != NGX_PROCESS_SINGLE)
+    {
+        return NGX_OK;
+    }
+    if (ngx_process == NGX_PROCESS_SINGLE && !ngx_http_isonim_single_running) {
+        ngx_http_isonim_single_running = 1;
+        ngx_log_error(NGX_LOG_WARN, cycle->log, 0,
+                      NGX_HTTP_ISONIM_SINGLE_WARNING);
+    }
     if (slots != NULL && ngx_worker < NGX_HTTP_ISONIM_BOUNDARY_MAX_SLOTS) {
         slots[ngx_worker] = 0;
     }
+    ngx_http_isonim_init_nim();
     return NGX_OK;
 }
 
