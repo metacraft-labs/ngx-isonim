@@ -1,0 +1,101 @@
+name: End-to-end (real nginx)
+
+# `just test-e2e`: real nginx with the real module, driven over the wire
+# (tests/e2e: test_e2e.sh, test_request_context, test_csp_nonce,
+# test_max_buffer_size, test_rpc, test_streaming_debug.sh, and
+# test_rpc_asan.sh: test_rpc against an AddressSanitizer build). These are the
+# IFP-M1 and IFP-M2 tests of
+# isonim-specs/milestones/2026-10-02-isonim-forum-prerequisites.milestones.org,
+# and nothing else in CI runs them: ci-reprobuild.yml builds and runs the
+# mock-mode `just test` only.
+#
+# The module is compiled from the sibling checkouts (scripts/build-module.sh
+# reads ../isonim/src, ../nim-everywhere/src, ../nim-faststreams and
+# ../nim-stew), which `setup-dev-env` clones from `.github/sibling-repos`.
+# A missing sibling fails the build; nothing is skipped.
+#
+# ONE LEG, linux-x64. The module is an nginx dynamic module tested on Linux
+# only: the e2e harness and the dev shell's `nginxCompat` are Linux-specific,
+# and the tests read /proc (test_streaming_debug.sh counts the worker's
+# descriptors). linux-arm64 and macos-arm64 are skipped for that reason and
+# for runner capacity (the self-hosted pool is saturated); Windows has no
+# nginx dynamic modules. Widen the matrix when the harness is portable.
+
+on:
+  push:
+    branches: [main, dev, stable]
+  pull_request:
+    branches: [main, dev, stable]
+
+# Cancel superseded PR runs only; every other event gets a group unique to
+# its run, so it is never cancelled and never cancels anything.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  test-e2e:
+    name: test-e2e (linux-x64)
+    runs-on: [self-hosted, linux, x64]
+    # Measured locally: ~6 minutes (module builds, including the mutant and
+    # debug builds, dominate). Wide margin for a cold Nix store.
+    timeout-minutes: 60
+    steps:
+      # The sibling clones and the private workspace-lock manifest need an
+      # installation token from the CI Token Provider app.
+      - name: Generate CI token
+        id: app-token
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ secrets.CI_TOKEN_PROVIDER_APP_ID }}
+          private-key: ${{ secrets.CI_TOKEN_PROVIDER_PRIVATE_KEY }}
+          owner: metacraft-labs
+
+      - uses: actions/checkout@v4
+
+      - name: Setup dev env (clones .github/sibling-repos)
+        uses: metacraft-labs/metacraft-github-actions/setup-dev-env@dev
+        with:
+          env-flavor: nix
+          gh-token: ${{ steps.app-token.outputs.token }}
+          substituters: ${{ vars.SUBSTITUTERS }}
+          trusted-public-keys: ${{ vars.TRUSTED_PUBLIC_KEYS }}
+
+      # Builds the module with the e2e apps and runs every end-to-end test;
+      # the full output goes to test-logs/ as well.
+      - name: just test-e2e
+        run: dev-exec just ci-test-e2e
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-e2e-linux-x64
+          path: test-logs/
+          retention-days: 1
+          if-no-files-found: warn
+
+      - name: Mirror artifacts to S3 (non-blocking)
+        if: always()
+        continue-on-error: true
+        shell: bash
+        env:
+          MCL_S3_ARTIFACTS_ENDPOINT: ${{ vars.MCL_S3_ARTIFACTS_ENDPOINT }}
+          MCL_S3_ARTIFACTS_BUCKET: ${{ vars.MCL_S3_ARTIFACTS_BUCKET }}
+          MCL_S3_ARTIFACTS_REGION: ${{ vars.MCL_S3_ARTIFACTS_REGION }}
+          AWS_ACCESS_KEY_ID: ${{ secrets.MCL_S3_ARTIFACTS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.MCL_S3_ARTIFACTS_SECRET_ACCESS_KEY }}
+          AWS_EC2_METADATA_DISABLED: "true"
+          S3_OBJECT_PREFIX: test-logs/${{ github.run_id }}
+        run: |
+          set -u
+          if [[ -z "${AWS_ACCESS_KEY_ID:-}" || -z "${MCL_S3_ARTIFACTS_ENDPOINT:-}" ]]; then
+            echo "S3 artifact store not configured for this repo; skipping mirror."
+            exit 0
+          fi
+          nix shell nixpkgs#awscli2 -c \
+            aws --endpoint-url "$MCL_S3_ARTIFACTS_ENDPOINT" \
+                --region "${MCL_S3_ARTIFACTS_REGION:-garage}" \
+                s3 cp --recursive test-logs/ \
+                "s3://${MCL_S3_ARTIFACTS_BUCKET:-ci-artifacts}/$S3_OBJECT_PREFIX/" \
+            || echo "::warning title=S3 artifact mirror::upload failed (non-blocking)"

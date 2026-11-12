@@ -17,8 +17,8 @@ suite "Config - Default":
     check not conf.maxBufferSizeSet
     check conf.hydrationEnabled
     check not conf.hydrationSet
-    check conf.scriptNonce == ""
-    check not conf.scriptNonceSet
+    check conf.mode == tmStreaming
+    check not conf.modeSet
 
   test "default_config_is_valid":
     check defaultLocConf().isValid()
@@ -34,7 +34,7 @@ suite "Config - Parsing":
     check conf.appName == "my-app"
     check conf.hydrationEnabled  # default
     check conf.maxBufferSize == 0  # default
-    check conf.scriptNonce == ""  # default
+    check conf.mode == tmStreaming  # default
 
   test "parse_all_fields":
     let conf = parseLocConf(
@@ -42,13 +42,13 @@ suite "Config - Parsing":
       appName = "my-app",
       maxBufferSize = 1024 * 1024,
       hydrationEnabled = true,
-      scriptNonce = "abc123",
+      mode = tmBuffered,
     )
     check conf.enabled
     check conf.appName == "my-app"
     check conf.maxBufferSize == 1024 * 1024
     check conf.hydrationEnabled
-    check conf.scriptNonce == "abc123"
+    check conf.mode == tmBuffered
 
   test "parse_disabled":
     let conf = parseLocConf(enabled = false)
@@ -140,6 +140,31 @@ suite "Config - Directive Parsing (individual directives)":
   test "parse_size_large":
     check parseSizeDirective("1048576") == 1048576
 
+  test "parse_size_with_nginx_suffixes":
+    # ngx_conf_set_size_slot accepts k/K and m/M; the C directive uses it.
+    check parseSizeDirective("64k") == 65536
+    check parseSizeDirective("64K") == 65536
+    check parseSizeDirective("2m") == 2 * 1024 * 1024
+    check parseSizeDirective("2M") == 2 * 1024 * 1024
+
+  test "parse_size_bad_suffix_raises":
+    expect ConfigError:
+      discard parseSizeDirective("64g")
+    expect ConfigError:
+      discard parseSizeDirective("k")
+    expect ConfigError:
+      discard parseSizeDirective("-1k")
+
+  test "parse_mode_valid":
+    check parseModeDirective("streaming") == tmStreaming
+    check parseModeDirective("buffered") == tmBuffered
+
+  test "parse_mode_invalid_raises":
+    expect ConfigError:
+      discard parseModeDirective("chunked")
+    expect ConfigError:
+      discard parseModeDirective("")
+
 
 suite "Config - Directive Parsing (parseDirective + applyDirective)":
   test "parse_and_apply_isonim_ssr_on":
@@ -172,12 +197,16 @@ suite "Config - Directive Parsing (parseDirective + applyDirective)":
     check conf.hydrationEnabled == false
     check conf.hydrationSet == true
 
-  test "parse_and_apply_isonim_ssr_script_nonce":
-    let dv = parseDirective(dkSsrScriptNonce, "abc123")
+  test "parse_and_apply_isonim_ssr_mode":
+    let dv = parseDirective(dkSsrMode, "buffered")
     var conf = defaultLocConf()
     applyDirective(conf, dv)
-    check conf.scriptNonce == "abc123"
-    check conf.scriptNonceSet == true
+    check conf.mode == tmBuffered
+    check conf.modeSet == true
+
+  test "invalid_mode_directive_raises":
+    expect ConfigError:
+      discard parseDirective(dkSsrMode, "fast")
 
   test "parse_and_apply_isonim_ssr_max_buffer_size":
     let dv = parseDirective(dkSsrMaxBufSize, "8192")
@@ -208,7 +237,7 @@ suite "Config - Merge":
       enabled = true,
       appName = "parent-app",
       hydrationEnabled = false,
-      scriptNonce = "parent-nonce",
+      mode = tmBuffered,
       maxBufferSize = 2048,
     )
     let child = defaultLocConf()  # all unset
@@ -216,7 +245,7 @@ suite "Config - Merge":
     check merged.enabled == true
     check merged.appName == "parent-app"
     check merged.hydrationEnabled == false
-    check merged.scriptNonce == "parent-nonce"
+    check merged.mode == tmBuffered
     check merged.maxBufferSize == 2048
 
   test "child_partial_override":
@@ -224,7 +253,7 @@ suite "Config - Merge":
       enabled = true,
       appName = "parent-app",
       hydrationEnabled = true,
-      scriptNonce = "parent-nonce",
+      mode = tmBuffered,
       maxBufferSize = 1024,
     )
     # Child only sets appName
@@ -235,7 +264,7 @@ suite "Config - Merge":
     check merged.appName == "child-app"
     check merged.enabled == true        # inherited
     check merged.hydrationEnabled == true  # inherited
-    check merged.scriptNonce == "parent-nonce"  # inherited
+    check merged.mode == tmBuffered  # inherited
     check merged.maxBufferSize == 1024   # inherited
 
   test "both_unset_uses_defaults":
@@ -246,7 +275,7 @@ suite "Config - Merge":
     check merged.appName == ""
     check merged.hydrationEnabled == true  # default
     check merged.maxBufferSize == 0
-    check merged.scriptNonce == ""
+    check merged.mode == tmStreaming  # default
 
   test "merge_preserves_set_flags":
     let parent = parseLocConf(enabled = true, appName = "app")
@@ -254,3 +283,48 @@ suite "Config - Merge":
     let merged = mergeLocConf(parent, child)
     check merged.enabledSet == true  # inherited from parent
     check merged.appNameSet == true
+
+suite "Config - isonim_rpc":
+  test "rpc_defaults":
+    let c = defaultLocConf()
+    check c.rpcEnabled == false
+    check c.rpcApp == ""
+    check c.rpcMaxBodySize == 1024 * 1024
+    check c.rpcTimeoutMs == 60_000
+
+  test "parse_and_apply_rpc_directives":
+    var c = defaultLocConf()
+    c.applyDirective(parseDirective(dkRpc, "on"))
+    c.applyDirective(parseDirective(dkRpcApp, "forum"))
+    c.applyDirective(parseDirective(dkRpcMaxBodySize, "1100k"))
+    c.applyDirective(parseDirective(dkRpcTimeout, "30s"))
+    check c.rpcEnabled and c.rpcEnabledSet
+    check c.rpcApp == "forum"
+    check c.rpcMaxBodySize == 1100 * 1024
+    check c.rpcTimeoutMs == 30_000
+    check c.isValid
+
+  test "parse_time_values_as_nginx_does":
+    check parseTimeDirective("500ms") == 500
+    check parseTimeDirective("30") == 30_000
+    check parseTimeDirective("1m30s") == 90_000
+    check parseTimeDirective("2h") == 7_200_000
+    expect ConfigError: discard parseTimeDirective("soon")
+    expect ConfigError: discard parseTimeDirective("5x")
+    expect ConfigError: discard parseTimeDirective("")
+
+  test "ssr_and_rpc_cannot_share_a_location":
+    var c = parseRpcLocConf()
+    check c.isValid
+    c.enabled = true
+    c.appName = "app"
+    check not c.isValid
+
+  test "rpc_settings_inherit":
+    let parent = parseRpcLocConf(appName = "forum", maxBodySize = 2048,
+                                 timeoutMs = 5000)
+    let merged = mergeLocConf(parent, defaultLocConf())
+    check merged.rpcEnabled
+    check merged.rpcApp == "forum"
+    check merged.rpcMaxBodySize == 2048
+    check merged.rpcTimeoutMs == 5000

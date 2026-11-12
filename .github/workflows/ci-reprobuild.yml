@@ -95,6 +95,14 @@ jobs:
         # Re-runs the legacy `just build` path inside the same env so
         # we catch silent divergences between `repro build` outputs
         # and what the dev shell + Justfile produce today.
+        #
+        # Not on Windows. `just build` compiles the nginx dynamic module
+        # (scripts/build-module.sh), and nginx has no dynamic modules on
+        # Windows (see e2e.yml); the script is POSIX-only (bash, GNU find,
+        # the nginx headers from the flake dev shell). repro.nim does not
+        # build the module either, so on Windows there is nothing to
+        # cross-check. `just test` below runs on every leg.
+        if: matrix.os != 'windows'
         run: dev-exec just build
 
       - name: just test (cross-check)

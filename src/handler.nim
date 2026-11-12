@@ -1,512 +1,351 @@
 ## handler.nim
 ##
-## nginx content handler and module registration.
-## This file is compiled as part of the nginx module .so.
+## The Nim side of the nginx content handler, and the root module of the
+## shared object.
 ##
-## The handler is called by nginx for configured routes. It runs
-## renderToString and writes the output through the nginx output
-## chain via the OutputStream abstraction.
+## `ngx_http_isonim_handler` (C) checks that the location is enabled,
+## discards the request body and calls `nim_handle_request` with a view of
+## the request and the location's configuration.  This module turns the view
+## into an `SsrRequest`, looks the app up, and runs the shared pipeline
+## (`serve.serve`) over a sink that calls back into the C helpers.
 ##
-## M3 flow:
-##   1. Validate HTTP method (GET/HEAD only, else 405)
-##   2. Validate configuration
-##   3. Look up app renderer by name from config
-##   4. Call the app renderer to get HTML
-##   5. Optionally append hydration script
-##   6. Set Content-Type and Content-Length headers
-##   7. For HEAD requests, return headers only (no body)
-##   8. Write body via the adapter
-##   9. Return appropriate status code
+## At an `isonim_rpc` location the C side reads the body first and calls
+## `nim_handle_rpc`, which starts the asynchronous pipeline of rpc.nim and
+## runs Nim's event loop (async_loop.nim); `nim_rpc_timeout` and
+## `nim_rpc_released` are that request's timeout and end.  An async app that
+## streams sends through the same sink while its request is in progress;
+## the C module's write handler drains what nginx could not send at once.
+##
+## Compiled with `-d:isNginxTest` the module instead provides
+## `serveRecorded` / `serveMockRequest` / `serveRpcRecorded`: the same
+## pipelines over a recording sink, so the unit tests exercise the code
+## nginx runs.
 
-import std/times
 import nginx_types
 import config
-import nginx_adapter
 import app_registry
+import serve
+import rpc
 
-type
-  RequestInfo* = object
-    ## Extracted request information passed to the app.
-    uri*: string
-    httpMethod*: string
-    headers*: seq[(string, string)]
-
-  HandlerResult* = object
-    ## Result of handling a request.
-    statusCode*: int
-    headers*: seq[(string, string)]
-    body*: string
-    chunks*: seq[string]
-
-  StreamingMetrics* = object
-    ## Timing and size metrics for streaming SSR responses.
-    ttfbMs*: float   ## Time from request start to first flush
-    totalMs*: float  ## Time from request start to close
-    chunkCount*: int ## Number of chunks emitted
-    totalBytes*: int ## Total bytes across all chunks
-
-proc handleSsrRequest*(conf: IsoNimLocConf; reqInfo: RequestInfo;
-    app: AppRenderer): HandlerResult =
-  ## Core SSR handler logic, independent of nginx.
-  ## This is testable without nginx headers.
-  ##
-  ## 1. Validates HTTP method
-  ## 2. Validates configuration
-  ## 3. Calls the app renderer
-  ## 4. Optionally appends hydration script placeholder
-  ## 5. Sets Content-Type and Content-Length headers
-  ## 6. For HEAD requests, headers only (empty body)
-  ## 7. Returns the complete response
-
-  # Method validation: only GET and HEAD allowed
-  if reqInfo.httpMethod notin ["GET", "HEAD"]:
-    return HandlerResult(
-      statusCode: NGX_HTTP_NOT_ALLOWED.int,
-      body: "Method Not Allowed",
-    )
-
-  if not conf.isValid():
-    return HandlerResult(
-      statusCode: NGX_HTTP_INTERNAL_SERVER_ERROR.int,
-      body: "IsoNim SSR: invalid configuration",
-    )
-
-  if app == nil:
-    return HandlerResult(
-      statusCode: NGX_HTTP_NOT_FOUND.int,
-      body: "IsoNim SSR: app not found",
-    )
-
-  var html: string
-  try:
-    html = app()
-  except CatchableError:
-    return HandlerResult(
-      statusCode: NGX_HTTP_INTERNAL_SERVER_ERROR.int,
-      body: "IsoNim SSR: render error",
-    )
-
-  # Append hydration script if enabled
-  if conf.hydrationEnabled:
-    var script = "<script"
-    if conf.scriptNonce.len > 0:
-      script.add " nonce=\"" & conf.scriptNonce & "\""
-    script.add ">window._$HY={events:[\"click\",\"input\"],completed:new WeakSet,registry:new Map};</script>"
-    html = html & script
-
-  let isHead = reqInfo.httpMethod == "HEAD"
-  let responseBody = if isHead: "" else: html
-
-  result = HandlerResult(
-    statusCode: NGX_HTTP_OK.int,
-    headers: @[
-      ("Content-Type", "text/html; charset=utf-8"),
-      ("Content-Length", $html.len),
-    ],
-    body: responseBody,
-    chunks: if isHead: @[] else: @[html],
-  )
-
-proc handleStreamingSsrRequest*(conf: IsoNimLocConf; reqInfo: RequestInfo;
-    app: AppRenderer;
-    onChunk: proc(chunk: string)): HandlerResult =
-  ## Streaming SSR handler. Renders the app and calls onChunk for each
-  ## piece of output. This simulates what the real nginx handler would
-  ## do: write each chunk to an ngx_buf_t and flush via output_filter.
-  if reqInfo.httpMethod notin ["GET", "HEAD"]:
-    return HandlerResult(
-      statusCode: NGX_HTTP_NOT_ALLOWED.int,
-      body: "Method Not Allowed",
-    )
-
-  if not conf.isValid():
-    return HandlerResult(
-      statusCode: NGX_HTTP_INTERNAL_SERVER_ERROR.int,
-      body: "IsoNim SSR: invalid configuration",
-    )
-
-  if app == nil:
-    return HandlerResult(
-      statusCode: NGX_HTTP_NOT_FOUND.int,
-      body: "IsoNim SSR: app not found",
-    )
-
-  var chunks: seq[string] = @[]
-
-  var html: string
-  try:
-    html = app()
-  except CatchableError:
-    return HandlerResult(
-      statusCode: NGX_HTTP_INTERNAL_SERVER_ERROR.int,
-      body: "IsoNim SSR: render error",
-    )
-
-  # Emit the rendered HTML as a chunk
-  chunks.add(html)
-  onChunk(html)
-
-  # Append hydration script if enabled
-  if conf.hydrationEnabled:
-    var script = "<script"
-    if conf.scriptNonce.len > 0:
-      script.add " nonce=\"" & conf.scriptNonce & "\""
-    script.add ">window._$HY={events:[\"click\",\"input\"],completed:new WeakSet,registry:new Map};</script>"
-    chunks.add(script)
-    onChunk(script)
-    html = html & script
-
-  result = HandlerResult(
-    statusCode: NGX_HTTP_OK.int,
-    headers: @[
-      ("Content-Type", "text/html; charset=utf-8"),
-    ],
-    body: html,
-    chunks: chunks,
-  )
-
-proc handleStreamingRequest*(conf: IsoNimLocConf; reqInfo: RequestInfo;
-    stream: NginxOutputStream;
-    streamingApp: StreamingAppRenderer): tuple[result: HandlerResult, metrics: StreamingMetrics] =
-  ## Streaming SSR handler.
-  ## 1. Validates config, looks up streaming app
-  ## 2. Sets Transfer-Encoding: chunked
-  ## 3. Flushes shell HTML immediately (TTFB)
-  ## 4. Each Suspense boundary resolution flushes a replacement script chunk
-  ## 5. Hydration script appended after all boundaries resolve
-  ## 6. Close stream
-
-  let startTime = cpuTime()
-  var metrics = StreamingMetrics()
-  var firstChunkFlushed = false
-
-  # Method validation: only GET and HEAD allowed
-  if reqInfo.httpMethod notin ["GET", "HEAD"]:
-    let elapsed = (cpuTime() - startTime) * 1000.0
-    metrics.totalMs = elapsed
-    return (
-      result: HandlerResult(
-        statusCode: NGX_HTTP_NOT_ALLOWED.int,
-        body: "Method Not Allowed",
-      ),
-      metrics: metrics,
-    )
-
-  if not conf.isValid():
-    let elapsed = (cpuTime() - startTime) * 1000.0
-    metrics.totalMs = elapsed
-    return (
-      result: HandlerResult(
-        statusCode: NGX_HTTP_INTERNAL_SERVER_ERROR.int,
-        body: "IsoNim SSR: invalid configuration",
-      ),
-      metrics: metrics,
-    )
-
-  if streamingApp == nil:
-    let elapsed = (cpuTime() - startTime) * 1000.0
-    metrics.totalMs = elapsed
-    return (
-      result: HandlerResult(
-        statusCode: NGX_HTTP_NOT_FOUND.int,
-        body: "IsoNim SSR: app not found",
-      ),
-      metrics: metrics,
-    )
-
-  let isHead = reqInfo.httpMethod == "HEAD"
-  var chunks: seq[string] = @[]
-  var totalBody = ""
-  var hadError = false
-
-  proc onChunk(chunk: string) =
-    chunks.add(chunk)
-    totalBody.add(chunk)
-    metrics.chunkCount += 1
-    metrics.totalBytes += chunk.len
-
-    if not isHead:
-      try:
-        stream.write(chunk)
-        stream.flush()
-      except CatchableError:
-        hadError = true
-
-    if not firstChunkFlushed:
-      metrics.ttfbMs = (cpuTime() - startTime) * 1000.0
-      firstChunkFlushed = true
-
-  var completed = false
-  proc onComplete() =
-    completed = true
-
-  try:
-    streamingApp(onChunk, onComplete)
-  except CatchableError:
-    if chunks.len == 0:
-      # Error during shell render — no chunks sent yet
-      let elapsed = (cpuTime() - startTime) * 1000.0
-      metrics.totalMs = elapsed
-      return (
-        result: HandlerResult(
-          statusCode: NGX_HTTP_INTERNAL_SERVER_ERROR.int,
-          body: "IsoNim SSR: render error",
-        ),
-        metrics: metrics,
-      )
-    else:
-      # Error during boundary resolution — partial result + error chunk
-      let errorChunk = "<script>console.error('IsoNim SSR: streaming error during boundary resolution')</script>"
-      chunks.add(errorChunk)
-      totalBody.add(errorChunk)
-      metrics.chunkCount += 1
-      metrics.totalBytes += errorChunk.len
-      if not isHead:
-        try:
-          stream.write(errorChunk)
-          stream.flush()
-        except CatchableError:
-          discard
-
-  # Append hydration script if enabled and we had at least one chunk
-  if conf.hydrationEnabled and chunks.len > 0:
-    var script = "<script"
-    if conf.scriptNonce.len > 0:
-      script.add " nonce=\"" & conf.scriptNonce & "\""
-    script.add ">window._$HY={events:[\"click\",\"input\"],completed:new WeakSet,registry:new Map};</script>"
-    chunks.add(script)
-    totalBody.add(script)
-    metrics.chunkCount += 1
-    metrics.totalBytes += script.len
-    if not isHead:
-      try:
-        stream.write(script)
-        stream.flush()
-      except CatchableError:
-        discard
-
-  # Close the stream
-  if not isHead:
-    try:
-      stream.close()
-    except CatchableError:
-      discard
-
-  metrics.totalMs = (cpuTime() - startTime) * 1000.0
-
-  let headers = @[
-    ("Content-Type", "text/html; charset=utf-8"),
-    ("Transfer-Encoding", "chunked"),
-  ]
-
-  return (
-    result: HandlerResult(
-      statusCode: NGX_HTTP_OK.int,
-      headers: headers,
-      body: if isHead: "" else: totalBody,
-      chunks: if isHead: @[] else: chunks,
-    ),
-    metrics: metrics,
-  )
+export config, app_registry, serve, rpc
 
 when defined(isNginxTest):
-  ## Test-mode entry point.  Mirrors the production nimHandleRequest but
-  ## works with MockRequest and the test-mode NginxOutputStream.
-  ##
-  ## The test-mode version extracts URI, method, and headers from the
-  ## mock request, builds an IsoNimLocConf, and runs the SSR handler.
-  ## It also creates an NginxOutputStream so tests can verify the
-  ## output-chain lifecycle.
+  type
+    RecordedSend* = object
+      ## One sendBody call.
+      data*: string
+      flush*: bool
+      last*: bool
 
-  var
-    testLocConf*: IsoNimLocConf = defaultLocConf()
-      ## Tests inject the location config here.
-    lastHandlerResult*: HandlerResult
-      ## After nimHandleRequest runs, the result is stored here for assertions.
+    RecordedResponse* = object
+      ## Everything the pipeline handed to the (recording) sink.
+      rc*: NgxInt
+        ## What the content handler would return to nginx.
+      headersSent*: bool
+      status*: int
+      contentType*: string
+      contentLength*: int64
+      headers*: seq[(string, string)]
+      body*: string
+        ## The concatenated body bytes that were sent.
+      sends*: seq[RecordedSend]
+      log*: seq[(NgxUint, string)]
+      held*: int
+        ## With `holdSent`: the bytes sent and not "read" (set it to 0 to
+        ## drain).
 
-  proc extractRequestInfo*(r: NgxHttpRequest): RequestInfo =
-    ## Extract URI, method, and headers from a mock request.
-    RequestInfo(
-      uri: r.uri,
-      httpMethod: r.httpMethod,
-      headers: r.headers,
+    RecordingOptions* = object
+      holdSent*: bool
+        ## The sink keeps every byte it is sent as unsent (a client that
+        ## reads nothing) until the test drains it (`RecordedResponse.held`).
+      failBodySendAt*: int
+        ## 1-based index of the sendBody call that fails as if the client
+        ## had gone away (NGX_ERROR); 0 = never.
+
+  proc recordingSink(req: SsrRequest; recPtr: ptr RecordedResponse;
+                     recording: RecordingOptions): ResponseSink =
+    ## A sink that records what it is given and behaves as nginx does for
+    ## HEAD, 204 and 304 (no body).
+    var sendCount = 0
+    ResponseSink(
+      sendHeader: proc(resp: SsrResponse; contentLength: int64): NgxInt =
+        doAssert not recPtr.headersSent, "headers sent twice"
+        recPtr.headersSent = true
+        recPtr.status = resp.status
+        recPtr.contentType = resp.contentType
+        recPtr.contentLength = contentLength
+        recPtr.headers = resp.wireHeaders
+        if req.httpMethod == "HEAD" or resp.status in [204, 304]:
+          NGX_DONE
+        else:
+          NGX_OK,
+      sendBody: proc(data: openArray[char]; flush, last: bool): NgxInt =
+        doAssert recPtr.headersSent, "body sent before the headers"
+        inc sendCount
+        if recording.failBodySendAt == sendCount:
+          return NGX_ERROR
+        var s = newString(data.len)
+        if data.len > 0:
+          copyMem(addr s[0], unsafeAddr data[0], data.len)
+        recPtr.sends.add RecordedSend(data: s, flush: flush, last: last)
+        recPtr.body.add s
+        if recording.holdSent:
+          recPtr.held += s.len
+        NGX_OK,
+      log: proc(level: NgxUint; msg: string) =
+        recPtr.log.add((level, msg)),
+      unsent: proc(): int = recPtr.held,
     )
 
-  proc nimHandleRequest*(r: NgxHttpRequest): NgxInt
-      {.exportc: "nim_handle_request", cdecl.} =
-    ## Called from the C module handler (test mode).
-    ##
-    ## M3 flow:
-    ## 1. Extract request info from the mock request
-    ## 2. Validate HTTP method
-    ## 3. Look up app renderer by name from testLocConf
-    ## 4. Create an NginxOutputStream from the mock request
-    ## 5. Run the SSR handler
-    ## 6. Write output through the stream and flush
-    ## 7. Return NGX_OK or the appropriate error code
-    let reqInfo = extractRequestInfo(r)
-    let conf = testLocConf
+  proc serveRecorded*(req: SsrRequest; app: AppEntry; opts: ServeOptions;
+                      recording = RecordingOptions()): RecordedResponse =
+    ## Runs the SSR pipeline over a recording sink.
+    var rec: RecordedResponse
+    rec.rc = serve(req, app, opts, recordingSink(req, addr rec, recording))
+    rec
 
-    # Look up app by name from the registry
-    let app = getApp(conf.appName)
+  type
+    RpcRecording* = ref object
+      ## One isonim_rpc request in mock mode.
+      response*: RecordedResponse
+      finished*: bool          ## the request was finalized
+      finalRc*: NgxInt         ## what it was finalized with
+      state*: RpcState
 
-    let res = handleSsrRequest(conf, reqInfo, app)
-    lastHandlerResult = res
+  proc startRpcRecorded*(req: SsrRequest; appName = "";
+                         timeoutMs = 0; opts = RpcOptions();
+                         recording = RecordingOptions()): RpcRecording =
+    ## Starts an isonim_rpc request over a recording sink.  `timeoutMs`
+    ## models isonim_rpc_timeout with an asyncdispatch timer (nginx uses its
+    ## own).  Drive the event loop (`poll`) until `finished`.
+    let r = RpcRecording()
+    let st = startRpc(req, appName,
+      recordingSink(req, addr r.response, recording),
+      proc(rc: NgxInt) =
+        doAssert not r.finished, "request finalized twice"
+        r.finished = true
+        r.finalRc = rc,
+      opts)
+    r.state = st
+    st.run()
+    if timeoutMs > 0:
+      sleepAsync(timeoutMs).addCallback(proc() {.gcsafe.} =
+        {.cast(gcsafe).}: st.timeout())
+    r
 
-    if res.statusCode != NGX_HTTP_OK.int:
-      return NgxInt(res.statusCode)
+  proc serveRpcRecorded*(req: SsrRequest; appName = "";
+                         timeoutMs = 0; opts = RpcOptions();
+                         recording = RecordingOptions()): RpcRecording =
+    ## Runs one isonim_rpc request to its end.
+    result = startRpcRecorded(req, appName, timeoutMs, opts, recording)
+    while not result.finished:
+      poll(10)
 
-    # For HEAD requests, skip body writing
-    if res.body.len == 0:
-      return NGX_OK
+  proc toSsrRequest*(r: NgxHttpRequest): SsrRequest =
+    ## The SsrRequest nim_handle_request would build from this request.
+    let raw =
+      if r.unparsedUri.len > 0: r.unparsedUri
+      elif r.args.len > 0: r.uri & "?" & r.args
+      else: r.uri
+    newSsrRequest(r.httpMethod, r.uri, raw, r.args, r.headers, r.addrText)
 
-    # Create an output stream and write the response body through it.
-    let stream = newNginxOutputStream(r)
-    resetMockState()  # Clear mock counters before our writes.
-
-    stream.write(res.body)
-    stream.flush()
-    stream.close()
-
-    return NGX_OK
+  proc serveMockRequest*(conf: IsoNimLocConf; r: NgxHttpRequest;
+                         recording = RecordingOptions()): RecordedResponse =
+    ## What the module does for request `r` at a location configured as
+    ## `conf`: look the app up by `isonim_ssr_app` and serve it.
+    serveRecorded(toSsrRequest(r), lookupApp(conf.appName),
+                  serveOptions(conf), recording)
 
 else:
-  ## Real nginx entry points. Two rendering paths:
-  ##
-  ## 1. STREAMING (production): nim_render_streaming
-  ##    Writes HTML directly to the nginx output chain through a faststreams
-  ##    OutputStream. The isonim SSR code (renderToOutputStream) is
-  ##    backend-agnostic — it works with any faststreams OutputStream.
-  ##
-  ## 2. BUFFERED (baseline): nim_render_app + nim_free_html
-  ##    Builds the full HTML string, copies to a C buffer, returned to the
-  ##    C handler which sends it as a single ngx_buf_t. Kept for performance
-  ##    comparison until the streaming path has more production mileage.
-
-  # When compiled with --noMain --app:lib, the Nim runtime (GC, module
-  # init code) is not automatically initialized. NimMain() must be called
-  # exactly once before any Nim code runs. It's generated by the compiler.
+  # When compiled with --noMain --app:lib, the Nim runtime (GC, module init
+  # code) is not initialized automatically.  NimMain() must run exactly once
+  # before any Nim code; nim_module_init does that on the first request.
+  import nginx_http_adapter
   import apps
+  import async_loop
+  import boundary     # its nim_boundary_* entry points
+
+  type
+    RequestView {.bycopy.} = object
+      ## Mirrors ngx_http_isonim_request_view_t (ngx_http_isonim_module.c).
+      httpMethod: NgxStr
+      uri: NgxStr
+      args: NgxStr
+      unparsedUri: NgxStr
+      addrText: NgxStr
+      headers: NgxListPart
 
   proc NimMain() {.importc.}
 
+  var initFailure: string
+    ## Why registering the apps failed in this worker (e.g. an app bound a
+    ## shared-memory zone the configuration does not declare); "" when it
+    ## did not.  Every request of the worker then answers 500 with it
+    ## logged: its apps are only partly registered.
+
   proc nimModuleInit*() {.exportc: "nim_module_init", cdecl.} =
-    ## Called once from C before the first request.
-    ## Initializes the Nim runtime and registers default apps.
+    ## Called once per worker, from C, when the worker starts (its
+    ## init_process), before it takes a connection.
     NimMain()
-    registerDefaultApps()
-
-  proc nimRenderApp*(appName: cstring, appNameLen: cint,
-                    hydration: cint,
-                    nonce: cstring, nonceLen: cint,
-                    outHtml: ptr cstring, outLen: ptr cint): NgxInt
-      {.exportc: "nim_render_app", cdecl.} =
-    ## Render an app by name and return the HTML via out-parameters.
-    ## The C caller is responsible for freeing *outHtml via nimFreeHtml.
-    ##
-    ## Parameters:
-    ##   appName/appNameLen — app name from nginx config (not null-terminated)
-    ##   hydration — 1 to append hydration script, 0 to skip
-    ##   nonce/nonceLen — CSP script nonce (may be NULL/0)
-    ##   outHtml/outLen — output: allocated HTML buffer and its length
-    ##
-    ## Returns NGX_OK on success, NGX_ERROR on failure.
-
-    # Build a Nim string from the (data, len) pair.
-    var name: string
-    if appNameLen > 0 and appName != nil:
-      name = newString(appNameLen)
-      copyMem(addr name[0], appName, appNameLen)
-    else:
-      name = ""
-
-    # Look up the app renderer.
-    let app = getApp(name)
-    if app == nil:
-      return NGX_ERROR
-
-    # Render the app.
-    var html: string
+    # Nothing may escape into nginx's C frames: an app's registerApps()
+    # that raises (ShmZoneError, ...) fails this worker's requests instead.
     try:
-      html = app()
-    except CatchableError:
-      return NGX_ERROR
+      registerDefaultApps()
+    except Exception as e:
+      initFailure = "registering the applications failed: " & $e.name &
+        ": " & e.msg
+      # Logged once now, at the worker's start, as well as with each
+      # request it then refuses.
+      ngx_http_isonim_log_cycle(NGX_LOG_ERR, unsafeAddr initFailure[0],
+                                csize_t(initFailure.len))
+    startAsyncLoop()
+    # Run what the registration queued and arm the timer for what waits, so
+    # a background task an app started runs now, not at the first request.
+    pump()
 
-    # Append hydration script if enabled.
-    if hydration != 0:
-      var script = "<script"
-      if nonceLen > 0 and nonce != nil:
-        var nonceStr = newString(nonceLen)
-        copyMem(addr nonceStr[0], nonce, nonceLen)
-        script.add " nonce=\"" & nonceStr & "\""
-      script.add ">window._$HY={events:[\"click\",\"input\"],completed:new WeakSet,registry:new Map};</script>"
-      html.add(script)
+  proc logTo(r: NgxHttpRequest; level: NgxUint; msg: string) =
+    if msg.len > 0:
+      ngx_http_isonim_log(r, level, unsafeAddr msg[0], csize_t(msg.len))
 
-    # Allocate a C-compatible buffer for the response.
-    # The C side frees it via nim_free_html.
-    let buf = cast[cstring](alloc(html.len + 1))
-    if html.len > 0:
-      copyMem(buf, addr html[0], html.len)
-    cast[ptr char](cast[uint](buf) + html.len.uint)[] = '\0'
+  proc refusedByInitFailure(r: NgxHttpRequest): bool =
+    ## Logs and reports a failed app registration (see `initFailure`).
+    if initFailure.len == 0:
+      return false
+    logTo(r, NGX_LOG_ERR, initFailure)
+    true
 
-    outHtml[] = buf
-    outLen[] = html.len.cint
-    return NGX_OK
+  proc nginxSink(r: NgxHttpRequest): ResponseSink =
+    ResponseSink(
+      sendHeader: proc(resp: SsrResponse; contentLength: int64): NgxInt =
+        let wire = resp.wireHeaders
+        var hdrs = newSeq[NgxIsonimHeader](wire.len)
+        for i in 0 ..< wire.len:
+          # Point into `wire` itself, which outlives the C call; the C
+          # side copies into the request pool.  (A `for (k, v) in wire`
+          # loop would hand out addresses of per-iteration copies.)
+          # Names are validated non-empty tokens; an empty value goes
+          # as a nil pointer with length 0.
+          hdrs[i] = NgxIsonimHeader(
+            key: unsafeAddr wire[i][0][0], keyLen: csize_t(wire[i][0].len),
+            value: (if wire[i][1].len > 0: unsafeAddr wire[i][1][0] else: nil),
+            valueLen: csize_t(wire[i][1].len))
+        let ct = resp.contentType
+        ngx_http_isonim_send_header(r, NgxUint(resp.status),
+          unsafeAddr ct[0], csize_t(ct.len), contentLength,
+          (if hdrs.len > 0: addr hdrs[0] else: nil), NgxUint(hdrs.len)),
+      sendBody: proc(data: openArray[char]; flush, last: bool): NgxInt =
+        ngx_http_isonim_send_body(r,
+          (if data.len > 0: unsafeAddr data[0] else: nil),
+          csize_t(data.len), NgxInt(ord(flush)), NgxInt(ord(last))),
+      log: proc(level: NgxUint; msg: string) =
+        logTo(r, level, msg),
+      unsent: proc(): int =
+        int(ngx_http_isonim_rpc_unsent(r)),
+    )
 
-  proc nimFreeHtml*(html: cstring) {.exportc: "nim_free_html", cdecl.} =
-    ## Free an HTML buffer previously returned by nimRenderApp.
-    if html != nil:
-      dealloc(html)
+  proc buildRequest(view: ptr RequestView; body = ""): SsrRequest =
+    var headers: seq[(string, string)]
+    for (k, v) in walkHeaders(view.headers):
+      headers.add((ngxStrToString(k), ngxStrToString(v)))
+    newSsrRequest(
+      httpMethod = ngxStrToString(view.httpMethod),
+      path = ngxStrToString(view.uri),
+      rawUri = ngxStrToString(view.unparsedUri),
+      query = ngxStrToString(view.args),
+      headers = headers,
+      clientAddr = ngxStrToString(view.addrText),
+      body = body)
 
-  when defined(useFaststreams):
-    proc nimRenderStreaming*(req: pointer, pool: pointer,
-                              appName: cstring, appNameLen: cint,
-                              hydration: cint,
-                              nonce: cstring, nonceLen: cint): NgxInt
-        {.exportc: "nim_render_streaming", cdecl.} =
-      ## Streaming render entry point. Called from the C streaming handler
-      ## after headers have been sent. Creates a NginxOutputStream wrapping
-      ## the nginx request and pool, then renders the app directly into it.
-      ##
-      ## The bytes flow: renderToOutputStream -> faststreams write ->
-      ## nginx adapter flushCallback -> ngx_buf_t -> ngx_http_output_filter
-      ## with no intermediate string copy beyond what the DSL produces.
-      ##
-      ## Parameters:
-      ##   req/pool -- opaque pointers to ngx_http_request_t and ngx_pool_t
-      ##   appName/appNameLen -- app name from nginx config
-      ##   hydration -- 1 to append hydration script, 0 to skip
-      ##   nonce/nonceLen -- CSP script nonce (may be NULL/0)
-      ##
-      ## Returns NGX_OK on success, NGX_ERROR on failure.
+  proc nimHandleRequest*(r: NgxHttpRequest; view: ptr RequestView;
+                         viewSize: csize_t;
+                         appName: ptr char; appNameLen: csize_t;
+                         hydration: NgxInt; buffered: NgxInt;
+                         maxBufferSize: csize_t): NgxInt
+      {.exportc: "nim_handle_request", cdecl.} =
+    ## Called by the C content handler for every request at an enabled
+    ## location.  Returns what the handler returns to nginx.
+    if viewSize != csize_t(sizeof(RequestView)):
+      logTo(r, NGX_LOG_ERR, "request view size mismatch between C (" &
+        $viewSize & ") and Nim (" & $sizeof(RequestView) & ")")
+      return NGX_HTTP_INTERNAL_SERVER_ERROR
+    if refusedByInitFailure(r):
+      return NGX_HTTP_INTERNAL_SERVER_ERROR
+    # Nothing may escape into nginx's C frames.  serve() handles every
+    # CatchableError itself; this catches what is left (a Defect in a
+    # debug build, e.g. an index error in an app) so one bad request
+    # cannot take the worker down with it.
+    try:
+      var name = newString(int(appNameLen))
+      if appNameLen > 0:
+        copyMem(addr name[0], appName, int(appNameLen))
+      let opts = ServeOptions(
+        appName: name,
+        hydration: hydration != 0,
+        mode: if buffered != 0: tmBuffered else: tmStreaming,
+        maxBufferSize: int(maxBufferSize))
+      serve(buildRequest(view), lookupApp(name), opts, nginxSink(r))
+    except Exception as e:
+      logTo(r, NGX_LOG_ERR, "unhandled " & $e.name & ": " & e.msg)
+      NGX_ERROR
 
-      # Build Nim strings from (data, len) pairs.
-      var name: string
-      if appNameLen > 0 and appName != nil:
-        name = newString(appNameLen)
-        copyMem(addr name[0], appName, appNameLen)
-      else:
-        name = ""
+  # ------------------------------------------------------------------------
+  # isonim_rpc locations
+  # ------------------------------------------------------------------------
 
-      var nonceStr: string
-      if nonceLen > 0 and nonce != nil:
-        nonceStr = newString(nonceLen)
-        copyMem(addr nonceStr[0], nonce, nonceLen)
-      else:
-        nonceStr = ""
+  proc nimHandleRpc*(r: NgxHttpRequest; cctx: pointer; view: ptr RequestView;
+                     viewSize: csize_t; body: ptr char; bodyLen: csize_t;
+                     appName: ptr char; appNameLen: csize_t;
+                     hydration: NgxInt; maxBufferSize: csize_t)
+      {.exportc: "nim_handle_rpc", cdecl.} =
+    ## Called by the C body handler once the request body is read.  Starts
+    ## the handler; the request is finalized (ngx_http_isonim_finalize)
+    ## when it completes, times out, or fails to start.
+    if viewSize != csize_t(sizeof(RequestView)):
+      logTo(r, NGX_LOG_ERR, "request view size mismatch between C (" &
+        $viewSize & ") and Nim (" & $sizeof(RequestView) & ")")
+      ngx_http_isonim_finalize(r, NGX_HTTP_INTERNAL_SERVER_ERROR)
+      return
+    if refusedByInitFailure(r):
+      ngx_http_isonim_finalize(r, NGX_HTTP_INTERNAL_SERVER_ERROR)
+      return
+    try:
+      var name = newString(int(appNameLen))
+      if appNameLen > 0:
+        copyMem(addr name[0], appName, int(appNameLen))
+      var bodyText = newString(int(bodyLen))
+      if bodyLen > 0:
+        copyMem(addr bodyText[0], body, int(bodyLen))
+      let st = startRpc(buildRequest(view, bodyText), name, nginxSink(r),
+        proc(rc: NgxInt) = ngx_http_isonim_finalize(r, rc),
+        RpcOptions(maxBufferSize: int(maxBufferSize),
+                   hydration: hydration != 0))
+      # Owned by the C side until the request pool is released
+      # (nim_rpc_released); bound before anything can finalize it.
+      GC_ref(st)
+      ngx_http_isonim_rpc_bind(cctx, cast[pointer](st))
+      st.run()
+    except Exception as e:
+      logTo(r, NGX_LOG_ERR, "unhandled " & $e.name & ": " & e.msg)
+      ngx_http_isonim_finalize(r, NGX_HTTP_INTERNAL_SERVER_ERROR)
+    pump()
 
-      # Cast opaque pointers to our nginx types.
-      let ngxReq = cast[NgxHttpRequest](req)
-      let ngxPool = cast[NgxPool](pool)
+  proc nimRpcTimeout*(state: pointer) {.exportc: "nim_rpc_timeout", cdecl.} =
+    ## `timeout` answers 504 and finalizes the request, which can destroy
+    ## its pool: the pool cleanup (`nimRpcReleased`) then drops the C
+    ## side's reference to the state while `timeout` is still running on
+    ## it.  This reference keeps the state alive until `timeout` has
+    ## returned; nothing here touches the request after the finalize.
+    let st = cast[RpcState](state)
+    GC_ref(st)
+    try:
+      st.timeout()
+    except Exception as e:
+      discard e     # nothing may escape into nginx's C frames
+    finally:
+      GC_unref(st)
 
-      # Create a faststreams-backed nginx output stream.
-      let outputHandle = nginxOutput(ngxReq, ngxPool)
+  proc nimRpcReleased*(state: pointer) {.exportc: "nim_rpc_released", cdecl.} =
+    let st = cast[RpcState](state)
+    st.release()
+    GC_unref(st)
 
-      try:
-        renderAppToStream(outputHandle.s, name,
-                          hydration = hydration != 0,
-                          nonce = nonceStr)
-      except CatchableError:
-        return NGX_ERROR
-
-      return NGX_OK

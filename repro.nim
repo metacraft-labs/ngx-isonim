@@ -57,9 +57,9 @@
 ## canonical Nim-consumer recipe ``isonim/repro.nim`` (its own SC-11 sibling
 ## consumer) and the leaf ``nim-pty/repro.nim`` / ``nim-libvterm/repro.nim``:
 ##
-## * Declares the toolchain floor via ``uses:`` (``nim`` + ``gcc``) plus the
-##   two sibling ``uses:`` edges. Mirrors the nimble file's
-##   ``requires "nim >= 2.0.0"``.
+## * Declares the toolchain floor via ``uses:`` (``nim``, the platform C
+##   compiler and ``just``) plus the two sibling ``uses:`` edges. Mirrors the
+##   nimble file's ``requires "nim >= 2.0.0"``.
 ## * Declares ``library ngx_isonim`` — the importable ``src/`` tree (so any
 ##   downstream repo could consume this module's adapters via
 ##   ``uses: "ngx-isonim"``). The exported path is ``src`` (convention
@@ -80,8 +80,10 @@
 ##     — ``-d:isNginxTest``. Under this define ``src/nginx_types.nim`` swaps to
 ##     the MOCK nginx bindings (no real nginx headers) and ``src/apps.nim``
 ##     compiles to nothing (its real ``import isonim/...`` block is
-##     ``when not defined(isNginxTest)``), so these tests are a pure-Nim LEAF —
-##     they need neither the nginx dev headers nor the isonim sibling. Six
+##     ``when not defined(isNginxTest)``), so these tests need no nginx dev
+##     headers.  They do compile against the isonim sibling: the request,
+##     response, request context and server-function modules are IsoNim's
+##     (``isonim/server``), threaded by the ``uses:`` edge below. Nine
 ##     files:
 ##       - ``test_adapter``            (``import ../src/nginx_adapter``)
 ##       - ``test_handler``            (``import ../src/handler`` + e2e/apps/hello)
@@ -89,6 +91,10 @@
 ##       - ``test_streaming_handler``  (``import ../src/{handler,nginx_adapter}``)
 ##       - ``test_e2e_integration``    (``import ../src/handler`` + 4 e2e apps)
 ##       - ``test_nginx_headers``      (``import ../src/nginx_http_adapter``)
+##       - ``test_request``            (``import ../src/{request,handler}``)
+##       - ``test_response``           (``import ../src/response``)
+##       - ``test_rpc``                (``import ../src/handler`` + isonim
+##         server functions: the isonim_rpc pipeline over asyncdispatch)
 ##     ``test_nginx_headers`` is not in a ``Justfile`` recipe but is a real
 ##     ``unittest`` suite that compiles + runs headless under ``-d:isNginxTest``
 ##     (it exercises the mock header-list adapter), so it gets a full edge.
@@ -105,23 +111,26 @@
 ##
 ## **Per-test platform gating.** Every test file is host-portable: none has
 ## an OS ``when defined(windows|macos|linux)`` extraction gate, and none is
-## host-exclusive. All eight tests compile + run to exit 0 under ``nim c`` on
+## host-exclusive. All ten tests compile + run to exit 0 under ``nim c`` on
 ## this Linux host — verified by a direct ``nim c`` sweep with the same paths +
 ## defines the edges below use. So there are no ``when defined(...)``
 ## extraction gates for the test set on this host.
 ##
-## **Not modelled.** ``tests/e2e/test_e2e.sh`` + the ``Justfile``
-## ``start-*`` / ``bench-*`` recipes drive a LIVE nginx server (build the
-## ``.so`` module, start nginx on a port, curl it / run ``wrk``). That is an
-## external-service integration path (a running nginx daemon), not a headless
-## ``unittest`` binary, so it is out of the sanctioned headless test scope and
-## gets no edge — the mock-mode + isonim-SSR ``unittest`` corpus above is the
+## **Not modelled.** ``tests/e2e/`` (``test_e2e.sh``,
+## ``test_request_context.nim``, ``test_csp_nonce.nim``,
+## ``test_max_buffer_size.nim``, ``test_streaming_debug.sh``; ``Justfile``
+## ``test-e2e``) and the ``start-*`` / ``bench-*`` recipes drive a LIVE nginx
+## server (build the ``.so`` module, start nginx on a port, curl it / run
+## ``wrk``). That is an external-service integration path (a running nginx
+## daemon), not a headless ``unittest`` binary, so it is out of the
+## sanctioned headless test scope and gets no edge — the mock-mode + isonim-SSR ``unittest`` corpus above is the
 ## complete set of files the repo compiles + runs with ``nim c -r``.
 ## The ``benchmarks/ssr_profile.nim`` profiler is likewise a benchmark driver,
 ## not a test, and is not modelled.
 ##
 ## **Tool provisioning.** ``defaultToolProvisioning "path"`` matches the
-## canonical recipes: the nix dev shell puts ``nim`` + ``gcc`` on ``PATH``,
+## canonical recipes: the nix dev shell puts ``nim`` + the C compiler
+## (``clang`` on macOS, ``gcc`` elsewhere) + ``just`` on ``PATH``,
 ## so the weak-local PATH resolver is the right default. It is also required
 ## for the ``uses:`` declarations to resolve at all ("typed tool provisioning
 ## is required for uses declarations").
@@ -152,8 +161,8 @@ proc spec(stem: string): NgxTestSpec =
   NgxTestSpec(source: "tests/" & stem & ".nim",
     binary: "build/test-bin/" & stem)
 
-# Mock/unit group — ``-d:isNginxTest``. Pure-Nim leaf (mock nginx bindings +
-# empty ``apps.nim``); no nginx headers, no isonim sibling.
+# Mock/unit group — ``-d:isNginxTest``. Mock nginx bindings + empty
+# ``apps.nim``; no nginx headers; isonim/server from the sibling.
 const mockTestSpecs: seq[NgxTestSpec] = @[
   spec("test_adapter"),
   spec("test_handler"),
@@ -161,6 +170,9 @@ const mockTestSpecs: seq[NgxTestSpec] = @[
   spec("test_streaming_handler"),
   spec("test_e2e_integration"),
   spec("test_nginx_headers"),
+  spec("test_request"),
+  spec("test_response"),
+  spec("test_rpc"),
 ]
 
 # IsoNim-SSR group — ``-d:isServer -d:asyncBackend=none`` + the SC-11 sibling
@@ -180,11 +192,23 @@ package ngx_isonim:
   uses:
     # Toolchain floor — the PATH-resolvable binaries the build needs. ``nim``
     # compiles every test binary (the ``buildNimUnittest.build`` edges below,
-    # matching the nimble file's ``requires "nim >= 2.0.0"``); ``gcc`` is the
-    # C back-end ``nim c`` shells out to. Sufficient for the path-mode
-    # resolver under ``nix develop``.
+    # matching the nimble file's ``requires "nim >= 2.0.0"``). Native Nim
+    # selects Clang on Darwin and GCC elsewhere as the C back-end it shells
+    # out to; declare that actual backend so its identity and executable
+    # directory reach each compile action under action-scoped tool
+    # selection. Sufficient for the path-mode resolver under ``nix develop``.
+    #
+    # ``just`` is declared because the ``Justfile`` recipes (``just build``,
+    # ``just test``, ...) run inside this package's environment: CI runs
+    # them through ``dev-exec`` after ``repro build`` / ``repro test``. On
+    # Windows there is no flake dev shell to supply it, and an undeclared
+    # ``just`` was not found there.
     "nim >=2.0"
-    "gcc >=12"
+    when defined(macosx):
+      "clang"
+    else:
+      "gcc >=12"
+    "just >=1"
 
     # The landed sibling Nim-library producers the IsoNim-SSR test consumes
     # from source (SC-11 develop-mode). Naming the workspace project here

@@ -57,6 +57,16 @@
           ];
         });
 
+        # The same nginx without HTTP/2 (--with-http_v2_module removed):
+        # the Boundary channel test's negative control
+        # (tests/integration/t_boundary_channel.nim) shows that a test peer
+        # facing it fails explicitly instead of falling back to HTTP/1.1.
+        # Built only when that test asks for it, never by the dev shell.
+        nginxCompatNoHttp2 = nginxCompat.overrideAttrs (old: {
+          pname = "nginx-no-http2";
+          configureFlags = builtins.filter (f: f != "--with-http_v2_module") (old.configureFlags or [ ]);
+        });
+
         # Configured nginx headers derived from the compat build.
         nginxDevHeaders = pkgs.callPackage ./nix/nginx-dev-headers.nix {
           nginx = nginxCompat;
@@ -69,8 +79,7 @@
         isOnimPath = "${isonim}/src";
         nimEverywherePath = "${nim-everywhere}/src";
 
-        # The .so module derivation.
-        ngxIsOnimModule = pkgs.callPackage ./nix/ngx-isonim-module.nix {
+        moduleArgs = {
           inherit
             nginxDevHeaders
             faststreamsPath
@@ -79,6 +88,18 @@
             nimEverywherePath
             ;
         };
+
+        # The .so module derivation (release, the production build).
+        ngxIsOnimModule = pkgs.callPackage ./nix/ngx-isonim-module.nix moduleArgs;
+
+        # The same module built in debug mode, and with the apps the
+        # end-to-end tests drive (tests/e2e/apps/e2e_apps.nim).
+        ngxIsOnimModuleDebug = pkgs.callPackage ./nix/ngx-isonim-module.nix (
+          moduleArgs // { buildMode = "debug"; }
+        );
+        ngxIsOnimModuleE2e = pkgs.callPackage ./nix/ngx-isonim-module.nix (
+          moduleArgs // { withTestApps = true; }
+        );
 
         # Pure C baseline module for performance comparison.
         baselineModule = pkgs.callPackage ./nix/baseline-module.nix {
@@ -116,9 +137,66 @@
             mkdir -p /tmp/ngx-baseline-test
             exec ${nginxCompat}/bin/nginx -c ${baselineConf} -p /tmp/ngx-baseline-test "$@"
           '';
-        # The repo's pre-commit hooks. Entering the default dev shell writes
-        # the (gitignored) .pre-commit-config.yaml symlink and installs them;
-        # CI's shared lint workflow runs the same set from this shell.
+        # The committed `.pre-commit-config.yaml` is what the pre-commit hook
+        # runs, with the flake's pre-commit: the flake provides the tools, the
+        # committed config provides the rules. git-hooks.nix's own installer
+        # refuses to replace a committed config and then installs nothing.
+        installGitHooks = ''
+          bash ${./scripts/install-git-hooks.sh} ${pkgs.lib.getExe preCommit.config.package} || exit $?
+        '';
+        # The hooks are installed into
+        # `git rev-parse --show-toplevel` of the directory the shell is entered
+        # from, so `nix develop /path/to/<this repo>` run inside another checkout
+        # would plant this repository's hooks there. `ownRepoOnly` runs a snippet
+        # only when that toplevel is this repository, recognised by a `flake.nix`
+        # identical to the one this shell was evaluated from; anything it cannot
+        # establish counts as another repository, so it fails safe.
+        # tests/test_dev_shell_writes_nothing_elsewhere.sh
+        ownRepoOnly = script: ''
+          _own_repo_root="$(${pkgs.git}/bin/git rev-parse --show-toplevel 2>/dev/null || true)"
+          if [ -n "$_own_repo_root" ] && [ -f "$_own_repo_root/flake.nix" ] \
+            && [ "$(${pkgs.coreutils}/bin/sha256sum "$_own_repo_root/flake.nix" | ${pkgs.coreutils}/bin/cut -d' ' -f1)" \
+              = "${builtins.hashFile "sha256" ./flake.nix}" ]; then
+          ${script}
+          # A clone where git-hooks.nix's own installer once ran keeps its RELATIVE
+          # core.hooksPath `.git/hooks`, in the config every worktree shares. A linked
+          # worktree cannot resolve it (there `.git` is a file), so git silently runs
+          # no hooks there. Point it at the common hooks directory instead.
+          if [ "$(${pkgs.git}/bin/git config --local --get core.hooksPath 2>/dev/null)" = .git/hooks ]; then
+            ${pkgs.git}/bin/git config --local core.hooksPath "$(${pkgs.git}/bin/git rev-parse --path-format=absolute --git-common-dir)/hooks"
+          fi
+          # `pre-commit install` (and git-hooks.nix's installer, where it once ran)
+          # moves each Reprobuild hook dispatcher aside to `<hook>.legacy` and puts
+          # its shim in the slot, so the managed hook (for pre-push, the publication
+          # gate) runs only by accident. Put the dispatcher back and chain the shim as
+          # `<hook>.repro-local`, which the dispatcher runs: the layout
+          # `repro hooks ensure --vcs` produces.
+          _hooks="$(${pkgs.git}/bin/git rev-parse --path-format=absolute --git-path hooks 2>/dev/null || true)"
+          for _legacy in "$_hooks"/*.legacy; do
+            [ -f "$_legacy" ] && grep -q 'reprobuild hook dispatcher' "$_legacy" || continue
+            _slot="''${_legacy%.legacy}"
+            if [ -f "$_slot" ] && grep -q 'reprobuild hook dispatcher' "$_slot"; then
+              rm -f "$_legacy"
+            elif [ ! -e "$_slot" ] || grep -Eq '^# File generated by (pre-commit|prek)' "$_slot"; then
+              if [ -f "$_slot.repro-local" ] && ! grep -Eq '^# File generated by (pre-commit|prek)' "$_slot.repro-local"; then
+                echo "git-hooks: $_slot.repro-local is your own hook; run 'repro hooks ensure --vcs' to reconcile." >&2
+                continue
+              fi
+              if [ -e "$_slot" ]; then mv -f "$_slot" "$_slot.repro-local"; fi
+              mv -f "$_legacy" "$_slot"
+            else
+              echo "git-hooks: $_slot is not a pre-commit shim; run 'repro hooks ensure --vcs' to reconcile." >&2
+            fi
+          done
+          unset _hooks _legacy _slot
+          fi
+          unset _own_repo_root
+        '';
+
+        # The repo's pre-commit hooks. Entering the default dev shell from inside
+        # this repository writes the (gitignored) .pre-commit-config.yaml symlink
+        # and installs them; CI's shared lint workflow runs the same set from this
+        # shell.
         preCommit = git-hooks.lib.${system}.run {
           src = ./.;
           hooks = {
@@ -137,6 +215,15 @@
             pkgs.wrk
             pkgs.jq
             nginxCompat
+            # Headers and libraries the module links against: the
+            # configured nginx headers include <crypt.h>, <pcre2.h>,
+            # <openssl/*.h> and <zlib.h>.  scripts/build-module.sh needs
+            # them to build the module outside Nix (the debug build of
+            # tests/e2e/test_streaming_debug.sh).
+            pkgs.pcre2
+            pkgs.openssl
+            pkgs.zlib
+            pkgs.libxcrypt
           ]
           ++ pkgs.lib.optionals isLinux [
             pkgs.strace
@@ -152,28 +239,38 @@
             pkgs.zlib
           ];
 
+          # The banner goes to stderr: `nix develop --command <cmd>` runs this
+          # hook too, so on stdout it would precede <cmd>'s own output, and
+          # .github/workflows/benchmark.yml redirects that output into the
+          # JSON files github-action-benchmark parses.
           shellHook = ''
-            ${preCommit.shellHook}
-            echo "ngx-isonim dev shell"
-            echo "  nim $(nim --version 2>&1 | head -1)"
-            echo "  nginx $(nginx -v 2>&1)"
-            echo "  nginx headers: $NGX_DEV_HEADERS"
+            ${ownRepoOnly installGitHooks}
+            {
+              echo "ngx-isonim dev shell"
+              echo "  nim $(nim --version 2>&1 | head -1)"
+              echo "  nginx $(nginx -v 2>&1)"
+              echo "  nginx headers: $NGX_DEV_HEADERS"
+            } >&2
           '';
         };
 
         packages = {
           module = ngxIsOnimModule;
+          module-debug = ngxIsOnimModuleDebug;
+          module-e2e = ngxIsOnimModuleE2e;
           baseline = baselineModule;
           nginx-with-isonim = nginxWithIsonim;
           nginx-baseline = nginxBaseline;
+          nginx-no-http2 = nginxCompatNoHttp2;
           default = ngxIsOnimModule;
         };
 
         apps.test-e2e = {
           type = "app";
           program = "${pkgs.writeShellScript "test-e2e" ''
-            export PATH="${nginxWithIsonim}/bin:${pkgs.curl}/bin:$PATH"
-            exec ${./tests/e2e/test_e2e.sh} "$@"
+            export PATH="${nginxCompat}/bin:${pkgs.curl}/bin:${pkgs.wrk}/bin:$PATH"
+            export NGX_ISONIM_E2E_MODULE=${ngxIsOnimModuleE2e}/lib/ngx_http_isonim_module.so
+            exec ${pkgs.bash}/bin/bash ${./tests/e2e}/test_e2e.sh "$@"
           ''}";
         };
       }
