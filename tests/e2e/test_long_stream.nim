@@ -8,9 +8,16 @@
 ## test_long_stream_memory_is_what_is_unsent
 ##   `stream_big` sends 128 MiB in 16 KiB flushed parts to a client that
 ##   reads as fast as it can, under `isonim_ssr_max_buffer_size 64k`.  The
-##   worker's resident set, sampled every 20 ms while it streams, grows by
-##   less than 32 MiB over its value before the request: the flushed parts
-##   are freed once nginx has written them.
+##   producer honours backpressure (`max_unsent`: before each part it waits
+##   until the body writer's `unsentBytes` is at most 1 MiB), so what the
+##   client has not read stays small whatever the relative speeds of the
+##   producer and the client.  The worker's resident set, sampled every
+##   20 ms while it streams, grows by less than 32 MiB over its value before
+##   the request: the flushed parts are freed once nginx has written them,
+##   and the memory is what is unsent.  (A producer that ignores
+##   backpressure legitimately holds everything it outran the client by,
+##   so without `max_unsent` the bound would measure how slow the producer
+##   is, not the module.)
 ##   Vacuity guard: the client receives all 128 MiB, byte for byte (the
 ##   position-dependent pattern), with the terminating chunk; and the
 ##   sampler took samples while the body was in flight.
@@ -54,6 +61,8 @@ const
   MaxGrowth = 32 * 1024 * 1024
   Threshold = 512 * 1024
   Cap = 64 * 1024 * 1024
+  MaxUnsent = 1024 * 1024
+    ## The backpressure bound the long stream's producer keeps to.
 
 let locations = """
     location /big/ {
@@ -202,7 +211,8 @@ suite "test_long_stream_memory_is_what_is_unsent":
   let n = startNginx(module, locations)
 
   test "128 MiB in 16 KiB flushes: the worker grows by less than 32 MiB, the body arrives whole":
-    let r = n.longStream("/big/b?size=" & $LongSize & "&part=" & $Part)
+    let r = n.longStream("/big/b?size=" & $LongSize & "&part=" & $Part &
+      "&max_unsent=" & $MaxUnsent)
     echo "    samples ", r.samples, ", max growth ", r.maxGrowth div 1024, " KiB"
     check r.received.terminated and not r.received.invalid
     check r.received.body.matchesPattern(LongSize)
@@ -220,7 +230,8 @@ suite "test_long_stream_memory_is_what_is_unsent":
     let mutant = buildMutant("pool-buffers", "src/ngx_http_isonim_module.c",
       "    if (len > 0 && ctx != NULL) {", "    if (len > 0 && ctx != NULL && 0) {")
     let m = startNginx(mutant, locations)
-    let r = m.longStream("/big/b?size=" & $LongSize & "&part=" & $Part)
+    let r = m.longStream("/big/b?size=" & $LongSize & "&part=" & $Part &
+      "&max_unsent=" & $MaxUnsent)
     m.stop()
     echo "    mutant: max growth ", r.maxGrowth div 1024, " KiB"
     check r.received.body.len == LongSize          # it streamed: the mutant's own guard

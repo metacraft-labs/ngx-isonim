@@ -74,6 +74,8 @@
     "nim-everywhere": {
       "flake": false,
       "locked": {
+        "lastModified": 1793178288,
+        "narHash": "sha256-8n6SaRXGiUD4hKDMGEuxVn7cK8Sy+ARDQ+Lni5uaYRg=",
         "owner": "metacraft-labs",
         "repo": "nim-everywhere",
         "rev": "2a41b67a6c0d41cbb55359c702f300eb2696682f",

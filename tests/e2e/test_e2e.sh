@@ -111,24 +111,36 @@ if [ -z "${MODULE}" ]; then
   fi
 fi
 
+# A port nobody listens on can still be bound by another socket (another
+# process's outgoing connection, say), so the connect probe only skips the
+# ports that are obviously taken: nginx's own bind() decides, and a start
+# that fails with EADDRINUSE is retried on another port.
 PORT=0
-for _ in $(seq 1 50); do
-  candidate=$((20000 + RANDOM % 30000))
-  if ! port_open "${candidate}"; then
-    PORT=${candidate}
+echo "Starting nginx..."
+for attempt in $(seq 1 10); do
+  for _ in $(seq 1 50); do
+    candidate=$((20000 + RANDOM % 30000))
+    if ! port_open "${candidate}"; then
+      PORT=${candidate}
+      break
+    fi
+  done
+  write_conf "${TEST_DIR}"
+  rm -f "${TEST_DIR}/error.log"
+  if nginx -c "${TEST_DIR}/nginx.conf" -p "${TEST_DIR}" -e "${TEST_DIR}/error.log" \
+    </dev/null >"${TEST_DIR}/start.log" 2>&1; then
     break
   fi
-done
-BASE_URL="http://127.0.0.1:${PORT}"
-
-write_conf "${TEST_DIR}"
-echo "Starting nginx..."
-if ! nginx -c "${TEST_DIR}/nginx.conf" -p "${TEST_DIR}" -e "${TEST_DIR}/error.log" \
-  </dev/null >"${TEST_DIR}/start.log" 2>&1; then
+  if [ "${attempt}" -lt 10 ] &&
+    grep -qF "Address already in use" "${TEST_DIR}/start.log" "${TEST_DIR}/error.log" 2>/dev/null; then
+    echo "  port ${PORT} is in use; retrying on another"
+    continue
+  fi
   cat "${TEST_DIR}/start.log" "${TEST_DIR}/error.log" 2>/dev/null
   echo "FATAL: nginx did not start"
   exit 1
-fi
+done
+BASE_URL="http://127.0.0.1:${PORT}"
 for _ in $(seq 1 200); do
   port_open "${PORT}" && break
   sleep 0.05

@@ -33,10 +33,18 @@
 # request, response, request-context and server-function modules
 # (isonim/src/isonim/server/{request,response,context,rpc}.nim), and since
 # IFP-M3 it serves IsoNim's hydration bootstrap (generateHydrationScript of
-# isonim/src/isonim/ssr/markers.nim). The pin is isonim@agents bd31893, the
-# commit that carries IFP-M3.
-isonim=bd318930aa26d5e2194da671011e09a269242c99  # isonim@agents (IFP-M3)
-nim-everywhere=749f037dd40da1d0c04f499f568dda18f7aebd1b  # nim-everywhere@dev tip
+# isonim/src/isonim/ssr/markers.nim). Since then it also imports
+# isonim/server/response_body and the writer's unsentBytes.
+#
+# These two SHAs MUST equal the `isonim` and `nim-everywhere` revisions in
+# repro.lock and flake.lock: `just test` and `just test-e2e` compile against
+# these clones, `nix build .#module` against the flake inputs. A pin moved in
+# the locks but not here builds CI against a different isonim than the one
+# every commit message reports verified (at bd31893 `just test` failed with
+# "cannot open file: isonim/server/response_body"). nim-everywhere is the
+# revision this isonim pins.
+isonim=2f4a6dba3bc2eca2d00d5448bf1a8d9d2ab4f49e  # isonim@agents (unsentBytes, streaming data entries)
+nim-everywhere=2a41b67a6c0d41cbb55359c702f300eb2696682f  # the revision isonim 2f4a6dba pins
 # scripts/build-module.sh compiles the module against ../nim-faststreams and
 # ../nim-stew (its DEFAULT_PATHS), so `just build` and `just test-e2e`
 # (.github/workflows/e2e.yml) need them on disk. The same revisions isonim's

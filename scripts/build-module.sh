@@ -23,8 +23,8 @@
 #                     sibling checkouts of the workspace.
 #   NGX_ISONIM_NIMCACHE  intermediate directory. Defaults to
 #                     .nimcache/module-<mode> inside the checkout.
-#   NGX_ISONIM_EXTRA_LDFLAGS  extra flags for the final link (the Darwin
-#                     derivation passes -Wl,-undefined,dynamic_lookup).
+#   NGX_ISONIM_EXTRA_LDFLAGS  extra flags for both links, Nim's and the
+#                     final one (the ASan tests pass -fsanitize=address).
 #   NGX_ISONIM_EXTRA_CFLAGS  extra flags for every C compile, the module's
 #                     and Nim's (`just test-e2e-asan` passes
 #                     -fsanitize=address).
@@ -82,10 +82,25 @@ for p in "${NIM_PATHS[@]}"; do
   NIM_PATH_FLAGS+=("--path:${p}")
 done
 
+# An nginx dynamic module is loaded BY the nginx executable and resolves
+# ngx_pcalloc, ngx_http_output_filter and the rest against it at load time,
+# so they are deliberately absent from both link lines below.  Nim's own
+# `--app:lib` link (step 1) also leaves undefined the module's C entry points
+# (ngx_http_isonim_send_header, ...), which only step 3 brings in.
+#
+# On ELF that is the default: a shared object may keep undefined symbols for
+# the loader to resolve.  Mach-O is the opposite -- every symbol must resolve
+# at link time unless the linker is told otherwise -- so on Darwin both links
+# fail with "Undefined symbols for architecture arm64".  `-undefined
+# dynamic_lookup` restores the ELF behaviour (ld(1) on macOS: "-undefined
+# treatment ... dynamic_lookup ... looked up at runtime").
 EXTRA_LD=()
+if [ "$(uname -s)" = Darwin ]; then
+  EXTRA_LD+=(-Wl,-undefined,dynamic_lookup)
+fi
 if [ -n "${NGX_ISONIM_EXTRA_LDFLAGS:-}" ]; then
   # shellcheck disable=SC2206 # deliberately split into separate flags
-  EXTRA_LD=(${NGX_ISONIM_EXTRA_LDFLAGS})
+  EXTRA_LD+=(${NGX_ISONIM_EXTRA_LDFLAGS})
 fi
 NIM_EXTRA_PASSL=()
 for f in "${EXTRA_LD[@]}"; do
@@ -136,7 +151,8 @@ cc -c -fPIC "${CC_MODE_FLAGS[@]}" "${EXTRA_CC[@]}" -Wall -Werror=implicit-functi
   "${ROOT}/src/ngx_http_isonim_module.c"
 
 # 3. One shared object.  nginx symbols stay undefined and are resolved
-#    against the nginx executable at load_module time.
+#    against the nginx executable at load_module time (see EXTRA_LD above
+#    for Darwin).
 cc -shared "${CC_MODE_FLAGS[@]}" "${EXTRA_LD[@]}" -o "${OUT}" \
   "${WORK}/ngx_http_isonim_module.o" \
   "${NIMCACHE}"/*.o \

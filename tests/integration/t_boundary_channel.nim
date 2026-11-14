@@ -408,11 +408,24 @@ proc helperRestart(module: string): seq[string] =
     result.add "vacuity: " & $managers.len & " cache manager(s) among our master's children"
     return
   discard posix.kill(Pid(managers[0]), SIGKILL)
+  # Every test of the condition reads ONE snapshot of our master's children.
+  # The cache manager goes through three states here -- the killed one still
+  # listed (a SIGKILL is delivered asynchronously), none (the killed one
+  # reaped, its successor forked but not yet titled "cache manager"), the
+  # respawned one -- and each `cacheManagers` call walks /proc anew, so two
+  # calls in one condition can see two different states: the old one alone
+  # for `len == 1`, then none for `notin`.  The wait then ended with no
+  # manager running, and the vacuity check, reading a third snapshot, failed.
+  proc respawned(now: seq[int]): bool = now.len == 1 and managers[0] notin now
   let deadline = getMonoTime() + initDuration(seconds = 10)
-  while getMonoTime() < deadline and (n.cacheManagers.len != 1 or managers[0] in n.cacheManagers):
+  var now = n.cacheManagers
+  while not respawned(now) and getMonoTime() < deadline:
     sleep(20)
-  if n.cacheManagers.len != 1 or managers[0] in n.cacheManagers:
-    result.add "vacuity: our master did not respawn the cache manager"
+    now = n.cacheManagers
+  if not respawned(now):
+    result.add "vacuity: our master did not respawn the cache manager " &
+      "(its children titled cache manager: " & $now & ", the killed one " &
+      $managers[0] & ")"
     return
   statuses = waitFor waitLive(n, f)
   result.add agreement(f, statuses, "after the cache manager's respawn")

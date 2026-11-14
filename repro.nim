@@ -57,9 +57,9 @@
 ## canonical Nim-consumer recipe ``isonim/repro.nim`` (its own SC-11 sibling
 ## consumer) and the leaf ``nim-pty/repro.nim`` / ``nim-libvterm/repro.nim``:
 ##
-## * Declares the toolchain floor via ``uses:`` (``nim`` + ``gcc``) plus the
-##   two sibling ``uses:`` edges. Mirrors the nimble file's
-##   ``requires "nim >= 2.0.0"``.
+## * Declares the toolchain floor via ``uses:`` (``nim``, the platform C
+##   compiler and ``just``) plus the two sibling ``uses:`` edges. Mirrors the
+##   nimble file's ``requires "nim >= 2.0.0"``.
 ## * Declares ``library ngx_isonim`` — the importable ``src/`` tree (so any
 ##   downstream repo could consume this module's adapters via
 ##   ``uses: "ngx-isonim"``). The exported path is ``src`` (convention
@@ -129,7 +129,8 @@
 ## not a test, and is not modelled.
 ##
 ## **Tool provisioning.** ``defaultToolProvisioning "path"`` matches the
-## canonical recipes: the nix dev shell puts ``nim`` + ``gcc`` on ``PATH``,
+## canonical recipes: the nix dev shell puts ``nim`` + the C compiler
+## (``clang`` on macOS, ``gcc`` elsewhere) + ``just`` on ``PATH``,
 ## so the weak-local PATH resolver is the right default. It is also required
 ## for the ``uses:`` declarations to resolve at all ("typed tool provisioning
 ## is required for uses declarations").
@@ -191,11 +192,23 @@ package ngx_isonim:
   uses:
     # Toolchain floor — the PATH-resolvable binaries the build needs. ``nim``
     # compiles every test binary (the ``buildNimUnittest.build`` edges below,
-    # matching the nimble file's ``requires "nim >= 2.0.0"``); ``gcc`` is the
-    # C back-end ``nim c`` shells out to. Sufficient for the path-mode
-    # resolver under ``nix develop``.
+    # matching the nimble file's ``requires "nim >= 2.0.0"``). Native Nim
+    # selects Clang on Darwin and GCC elsewhere as the C back-end it shells
+    # out to; declare that actual backend so its identity and executable
+    # directory reach each compile action under action-scoped tool
+    # selection. Sufficient for the path-mode resolver under ``nix develop``.
+    #
+    # ``just`` is declared because the ``Justfile`` recipes (``just build``,
+    # ``just test``, ...) run inside this package's environment: CI runs
+    # them through ``dev-exec`` after ``repro build`` / ``repro test``. On
+    # Windows there is no flake dev shell to supply it, and an undeclared
+    # ``just`` was not found there.
     "nim >=2.0"
-    "gcc >=12"
+    when defined(macosx):
+      "clang"
+    else:
+      "gcc >=12"
+    "just >=1"
 
     # The landed sibling Nim-library producers the IsoNim-SSR test consumes
     # from source (SC-11 develop-mode). Naming the workspace project here

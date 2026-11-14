@@ -111,11 +111,22 @@ proc startNode(module: string; extra = ""; http2 = true;
                nodeCert = pki.node; httpExtra = ""): Node =
   ## `httpExtra` goes into the http block (e.g. a `proxy_cache_path`, whose
   ## cache manager and loader processes nginx starts beside the workers).
-  result.bport = freePort()
-  result.nginx = startNginx(module, appLocations, workerProcesses = workers,
-    httpConf = "  keepalive_requests 1000000;\n" & httpExtra &
-      boundaryServer(result.bport, extra, http2, nodeCert = nodeCert),
-    listenOptions = "reuseport")
+  ##
+  ## The Boundary listener's port, like startNginx's own, can be taken
+  ## between `freePort` and nginx's bind: such a start is retried on a
+  ## fresh port.
+  const attempts = 10
+  for attempt in 1 .. attempts:
+    result.bport = freePort()
+    try:
+      result.nginx = startNginx(module, appLocations, workerProcesses = workers,
+        httpConf = "  keepalive_requests 1000000;\n" & httpExtra &
+          boundaryServer(result.bport, extra, http2, nodeCert = nodeCert),
+        listenOptions = "reuseport")
+      break
+    except OSError as e:
+      if attempt == attempts or not e.msg.addressInUse(result.bport):
+        raise
 
 proc stop(n: Node) = n.nginx.stop()
 
