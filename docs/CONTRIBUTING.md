@@ -62,9 +62,12 @@ ngx-isonim/
 just build
 ```
 
-Compiles the module with `nim c` using ORC memory management, producing
-`build/ngx_http_isonim_module.so`. Requires `$NGX_DEV_HEADERS` to point at
-nginx development headers (set automatically by the Nix dev shell).
+Runs `scripts/build-module.sh release`, producing
+`build/ngx_http_isonim_module.so` (the Nim side plus the C module file, ORC
+memory management). Requires `$NGX_DEV_HEADERS` to point at nginx
+development headers (set automatically by the Nix dev shell).
+`just build-debug` builds the same module in debug mode, and
+`just build-e2e` with the apps the end-to-end tests drive.
 
 ### Nix-based build
 
@@ -117,13 +120,23 @@ Runs end-to-end tests that exercise the full rendering pipeline: IsoNim
 reactive core, DSL, SSR renderer, and faststreams output. Requires the
 `../isonim`, `../nim-faststreams`, and `../nim-stew` sibling repos.
 
+### End-to-end tests (real nginx)
+
+```bash
+just test-e2e
+```
+
+Builds the module with the e2e apps and runs `tests/e2e/`: the curl smoke
+test, request context and response shaping, per-response CSP nonces, the
+buffer limit, and the streaming handler under a debug build.
+
 ### All tests
 
 ```bash
 just test-all
 ```
 
-Runs unit tests plus E2E integration tests.
+Runs the unit, integration, IsoNim SSR and end-to-end tests.
 
 ### The `-d:isNginxTest` flag
 
@@ -203,61 +216,78 @@ throughput/latency shows the cost of the Nim rendering pipeline.
 
 ## Architecture
 
-### Two rendering paths
+### Two transports
 
-The module supports two rendering strategies:
+`isonim_ssr_mode` picks, per location, how the body travels:
 
-1. **Buffered (stable)** -- `nim_render_app` renders the entire response to
-   a string, then copies it into an nginx buffer. Simple, correct, and the
-   default for development/testing.
+1. **Streaming (default)** -- the status and headers go out on the
+   renderer's first flush, each flush is sent to the client at once (nginx
+   `flush` flag), and the response ends with `last_buf` (the terminating
+   chunk).
+2. **Buffered** -- the whole body is rendered first and sent with
+   `Content-Length`.
 
-2. **Streaming (faster)** -- `nim_render_streaming` writes SSR output
-   directly to a faststreams `OutputStream` backed by the nginx output
-   chain adapter. Avoids intermediate string copies. Intended for
-   production use and release builds.
+Both run the same pipeline (`serve.nim`), which the unit tests also run
+over a recording sink.
 
 ### Request flow
 
 ```
 nginx request
-  -> C module (ngx_http_isonim_module.c)
-    -> Nim handler (handler.nim)
-      -> App registry lookup (app_registry.nim)
-        -> IsoNim SSR renderer (isonim/ssr/renderer)
-          -> faststreams OutputStream
-            -> nginx adapter (nginx_adapter.nim)
-              -> ngx_buf_t / ngx_http_output_filter
-                -> client response
+  -> ngx_http_isonim_handler (C): location enabled? discard the body
+    -> nim_handle_request (handler.nim): build the SsrRequest
+      -> serve (serve.nim): method check, app lookup, render, hydration
+         script with the per-response CSP nonce, max buffer size
+        -> renderer(req, resp[, body])           (app_registry.nim)
+        -> ngx_http_isonim_send_header / _send_body (C helpers)
+          -> nginx header and output filters -> client
 ```
 
 ### Key abstractions
 
-- **nginx_adapter.nim** -- implements a faststreams `OutputStreamVTable`
-  that allocates `ngx_buf_t` buffers from the nginx pool and feeds them
-  into the output filter chain. This makes nginx the third async I/O
-  backend alongside Chronos and asyncdispatch.
+- **serve.nim** -- the request pipeline, shared by the module and the
+  unit tests.
+- **response_body.nim** -- the streaming writer; `outputStream` gives
+  IsoNim's renderer a faststreams `OutputStream` (nim-faststreams'
+  `nginx_adapters`), making nginx the third faststreams backend alongside
+  Chronos and asyncdispatch.
 
 - **app_registry.nim** -- a simple name-to-renderer lookup table. Apps
   register themselves at module init time.
 
-- **config.nim** -- parses nginx directives (`isonim_ssr`,
-  `isonim_ssr_app`, `isonim_ssr_hydration`, etc.) into per-location
-  configuration structs.
+- **config.nim** -- the directive model (`isonim_ssr`, `isonim_ssr_app`,
+  `isonim_ssr_hydration`, `isonim_ssr_mode`, `isonim_ssr_max_buffer_size`)
+  mirroring the C location configuration.
 
 ## Adding a New App
 
-To register a new SSR app, edit `src/apps.nim`:
+Register a renderer in `src/apps.nim`.  It receives the request and the
+response it may shape:
 
 ```nim
-# In registerDefaultApps():
-registerApp("my_app", proc(): string =
-  # Use IsoNim reactive primitives and DSL here
+registerApp("my_app", proc(req: SsrRequest; resp: SsrResponse): string =
+  resp.setHeader("Cache-Control", "private, no-cache, must-revalidate")
   renderToString do () -> string:
     ui:
       tdiv(class = "my-app"):
-        h1: text "My New App"
+        h1: text "Hello " & req.queryParam("name", "world")
 )
 ```
+
+A streaming renderer writes through a `ResponseBody`; IsoNim's Suspense
+streaming takes its faststreams view:
+
+```nim
+registerStreamingApp("my_stream", proc(req: SsrRequest; resp: SsrResponse;
+                                       body: ResponseBody) =
+  let sr = renderToStream(shell, body.outputStream,
+                          StreamOptions(nonce: resp.cspNonce))
+  sr.ctx.resolveBoundary("b1", "<p>later</p>")
+)
+```
+
+`routedApp(routes)` (src/ssr_router.nim) selects the component from the
+request path with IsoNim's SSR router and answers unknown paths with 404.
 
 Then configure the nginx location to serve it:
 
@@ -267,9 +297,6 @@ location /my-app {
     isonim_ssr_app my_app;
 }
 ```
-
-For streaming support, also implement a `renderAppToStream` variant that
-writes to a faststreams `OutputStream` instead of returning a string.
 
 ## Nix Flake
 

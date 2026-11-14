@@ -23,8 +23,16 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: DeterminateSystems/nix-installer-action@main
-      - uses: DeterminateSystems/magic-nix-cache-action@main
+      # Nix comes from the shared setup-nix action, not from
+      # DeterminateSystems/nix-installer-action + magic-nix-cache-action:
+      # Nix is already on the self-hosted runners, and magic-nix-cache's
+      # restore pipes through `xz`, which is not on the runner PATH
+      # ("/bin/sh: xz: command not found"), so this step failed every job.
+      # Binary-cache traffic goes through the org Attic substituter instead.
+      - uses: metacraft-labs/devops-modules/.github/setup-nix@dev
+        with:
+          trusted-public-keys: ${{ vars.ATTIC_TRUSTED_PUBLIC_KEY }}
+          substituters: ${{ vars.ATTIC_SUBSTITUTER }}
 
       - name: Build nginx module
         run: nix build .#module
@@ -58,8 +66,16 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: DeterminateSystems/nix-installer-action@main
-      - uses: DeterminateSystems/magic-nix-cache-action@main
+      # Nix comes from the shared setup-nix action, not from
+      # DeterminateSystems/nix-installer-action + magic-nix-cache-action:
+      # Nix is already on the self-hosted runners, and magic-nix-cache's
+      # restore pipes through `xz`, which is not on the runner PATH
+      # ("/bin/sh: xz: command not found"), so this step failed every job.
+      # Binary-cache traffic goes through the org Attic substituter instead.
+      - uses: metacraft-labs/devops-modules/.github/setup-nix@dev
+        with:
+          trusted-public-keys: ${{ vars.ATTIC_TRUSTED_PUBLIC_KEY }}
+          substituters: ${{ vars.ATTIC_SUBSTITUTER }}
 
       - name: Build nginx with isonim module
         run: nix build .#nginx-with-isonim
