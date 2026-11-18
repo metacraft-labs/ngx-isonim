@@ -79,6 +79,15 @@ location /api/v1/rpc/ {
     isonim_rpc_max_body_size 1m;      # default 1m; larger bodies get 413
     isonim_rpc_timeout 60s;           # default 60s; then 504
 }
+# A long-lived response (a stream): no overall timeout, but its header is
+# bounded, and a reload's old worker answers it before exiting.
+location = /api/v1/stream {
+    isonim_rpc on;
+    isonim_rpc_app app;
+    isonim_rpc_timeout 0;             # 0 = none
+    isonim_rpc_header_timeout 30s;    # only with isonim_rpc_timeout 0; default 60s;
+                                      # no header by then: 504
+}
 location / {
     isonim_rpc on;
     isonim_rpc_app forum;             # registerAsyncApp("forum", manifestApp(...))

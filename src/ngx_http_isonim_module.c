@@ -109,7 +109,10 @@ extern ngx_int_t nim_handle_request(
 typedef struct {
     ngx_uint_t           kind;       /* NGX_HTTP_ISONIM_CTX_RPC             */
     ngx_http_request_t  *request;
-    ngx_event_t          timeout;    /* isonim_rpc_timeout                  */
+    ngx_event_t          timeout;    /* isonim_rpc_timeout, or
+                                      * isonim_rpc_header_timeout until the
+                                      * response header is sent            */
+    ngx_flag_t           header_timer; /* `timeout` is the header timeout   */
     void                *nim_state;  /* rpc.nim's RpcState (GC_ref'd)       */
     size_t               body_limit; /* isonim_rpc_max_body_size; 0 = none  */
     off_t                body_read;  /* body bytes seen by the body filter  */
@@ -131,8 +134,9 @@ extern void nim_handle_rpc(
     const u_char *body, size_t body_len,
     const u_char *app_name, size_t app_name_len,
     ngx_int_t hydration, size_t max_buffer_size);
-/* rpc.nim: isonim_rpc_timeout expired. */
-extern void nim_rpc_timeout(void *nim_state);
+/* rpc.nim: isonim_rpc_timeout expired, or (header != 0)
+ * isonim_rpc_header_timeout before the response header. */
+extern void nim_rpc_timeout(void *nim_state, ngx_int_t header);
 /* rpc.nim: the request pool is being destroyed; drop the state. */
 extern void nim_rpc_released(void *nim_state);
 /* async_loop.nim: run what is ready on Nim's event loop. */
@@ -167,6 +171,7 @@ typedef struct {
     ngx_str_t   rpc_app;            /* "" = the server-function registry   */
     size_t      rpc_max_body_size;  /* 0 = unlimited                       */
     ngx_msec_t  rpc_timeout;        /* 0 = none                            */
+    ngx_msec_t  rpc_header_timeout; /* without rpc_timeout; 0 = none       */
 } ngx_http_isonim_loc_conf_t;
 
 /* ------------------------------------------------------------------ */
@@ -318,6 +323,18 @@ static ngx_command_t ngx_http_isonim_commands[] = {
       offsetof(ngx_http_isonim_loc_conf_t, rpc_timeout),
       NULL },
 
+    /* nginx time; only where isonim_rpc_timeout is 0 (a long-lived
+     * response, a stream): a handler that has not sent its response header
+     * by then gets 504.  Its timer, not cancelable, is also what keeps a
+     * gracefully exiting worker (a reload) alive until the request it holds
+     * has answered, at most this long.  0 = none. */
+    { ngx_string("isonim_rpc_header_timeout"),
+      NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1,
+      ngx_conf_set_msec_slot,
+      NGX_HTTP_LOC_CONF_OFFSET,
+      offsetof(ngx_http_isonim_loc_conf_t, rpc_header_timeout),
+      NULL },
+
     /* isonim_shm_zone <name> size=<size> [max_value=<size>]: a
      * shared-memory zone an application binds by name (shmTable). */
     { ngx_string("isonim_shm_zone"),
@@ -418,6 +435,7 @@ ngx_http_isonim_create_loc_conf(ngx_conf_t *cf)
     conf->rpc_enabled = NGX_CONF_UNSET;
     conf->rpc_max_body_size = NGX_CONF_UNSET_SIZE;
     conf->rpc_timeout = NGX_CONF_UNSET_MSEC;
+    conf->rpc_header_timeout = NGX_CONF_UNSET_MSEC;
     return conf;
 }
 
@@ -438,6 +456,8 @@ ngx_http_isonim_merge_loc_conf(ngx_conf_t *cf, void *parent, void *child)
     ngx_conf_merge_size_value(conf->rpc_max_body_size, prev->rpc_max_body_size,
                               1024 * 1024);
     ngx_conf_merge_msec_value(conf->rpc_timeout, prev->rpc_timeout, 60000);
+    ngx_conf_merge_msec_value(conf->rpc_header_timeout,
+                              prev->rpc_header_timeout, 60000);
 
     if (conf->enabled && conf->app_name.len == 0) {
         ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
@@ -681,6 +701,21 @@ ngx_http_isonim_send_header(ngx_http_request_t *r, ngx_uint_t status,
     }
 
     rc = ngx_http_send_header(r);
+
+    /* The header is out: isonim_rpc_header_timeout no longer applies, and
+     * from here a reload ends the response as it always did (the client
+     * reconnects). */
+    {
+        ngx_http_isonim_rpc_ctx_t  *ctx = ngx_http_get_module_ctx(r, ngx_http_isonim_module);
+
+        if (ctx != NULL && ctx->kind == NGX_HTTP_ISONIM_CTX_RPC && ctx->header_timer) {
+            if (ctx->timeout.timer_set) {
+                ngx_del_timer(&ctx->timeout);
+            }
+            ctx->header_timer = 0;
+        }
+    }
+
     if (rc == NGX_ERROR || rc > NGX_OK) return rc;
     if (r->header_only) return NGX_DONE;
     return rc;
@@ -891,7 +926,7 @@ ngx_http_isonim_rpc_timeout_handler(ngx_event_t *ev)
     ngx_http_isonim_rpc_ctx_t  *ctx = ev->data;
 
     if (ctx->nim_state != NULL) {
-        nim_rpc_timeout(ctx->nim_state);
+        nim_rpc_timeout(ctx->nim_state, ctx->header_timer);
         nim_async_pump();
     }
 }
@@ -1009,6 +1044,15 @@ ngx_http_isonim_rpc_body_handler(ngx_http_request_t *r)
 
     if (conf->rpc_timeout) {
         ngx_add_timer(&ctx->timeout, conf->rpc_timeout);
+    } else if (conf->rpc_header_timeout) {
+        /* A long-lived response (isonim_rpc_timeout 0) is still bounded
+         * until its header is sent (ngx_http_isonim_send_header removes the
+         * timer then).  Like isonim_rpc_timeout's, the timer is not
+         * cancelable: a gracefully exiting worker (a reload) stays until
+         * every request it holds has sent its header or timed out, instead
+         * of closing the connection before any response. */
+        ngx_add_timer(&ctx->timeout, conf->rpc_header_timeout);
+        ctx->header_timer = 1;
     }
 
     /* While Nim works, notice a client that closes the connection: nginx

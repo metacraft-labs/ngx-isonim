@@ -30,6 +30,7 @@ type
     dkRpcApp          ## isonim_rpc_app <name>
     dkRpcMaxBodySize  ## isonim_rpc_max_body_size <size>
     dkRpcTimeout      ## isonim_rpc_timeout <time>
+    dkRpcHeaderTimeout ## isonim_rpc_header_timeout <time>
 
   TransportMode* = enum
     ## How the response body travels (`isonim_ssr_mode`).
@@ -73,6 +74,11 @@ type
     ## Handler timeout in milliseconds (0 = none); default 60s.
     rpcTimeoutMs*: int
     rpcTimeoutSet*: bool
+    ## Where rpcTimeoutMs is 0: the time before the response header, in
+    ## milliseconds (0 = none); default 60s. Also how long a gracefully
+    ## exiting worker keeps such a request.
+    rpcHeaderTimeoutMs*: int
+    rpcHeaderTimeoutSet*: bool
 
   ConfigError* = object of CatchableError
     ## Raised when a directive value cannot be parsed.
@@ -80,6 +86,7 @@ type
 const
   defaultRpcMaxBodySize* = 1024 * 1024   ## isonim_rpc_max_body_size: 1m
   defaultRpcTimeoutMs* = 60_000          ## isonim_rpc_timeout: 60s
+  defaultRpcHeaderTimeoutMs* = 60_000    ## isonim_rpc_header_timeout: 60s
 
 proc defaultLocConf*(): IsoNimLocConf =
   ## Returns the default per-location configuration.
@@ -100,6 +107,7 @@ proc defaultLocConf*(): IsoNimLocConf =
     modeSet: false,
     rpcMaxBodySize: defaultRpcMaxBodySize,
     rpcTimeoutMs: defaultRpcTimeoutMs,
+    rpcHeaderTimeoutMs: defaultRpcHeaderTimeoutMs,
   )
 
 proc parseLocConf*(enabled: bool; appName: string = "";
@@ -120,6 +128,7 @@ proc parseLocConf*(enabled: bool; appName: string = "";
     modeSet: true,
     rpcMaxBodySize: defaultRpcMaxBodySize,
     rpcTimeoutMs: defaultRpcTimeoutMs,
+    rpcHeaderTimeoutMs: defaultRpcHeaderTimeoutMs,
   )
 
 proc parseRpcLocConf*(appName = ""; maxBodySize = defaultRpcMaxBodySize;
@@ -134,6 +143,7 @@ proc parseRpcLocConf*(appName = ""; maxBodySize = defaultRpcMaxBodySize;
   result.rpcMaxBodySizeSet = true
   result.rpcTimeoutMs = timeoutMs
   result.rpcTimeoutSet = true
+  result.rpcHeaderTimeoutMs = defaultRpcHeaderTimeoutMs
 
 # ----------------------------------------------------------------
 # Individual directive parsers
@@ -239,7 +249,7 @@ proc parseDirective*(kind: DirectiveKind; value: string): DirectiveValue =
     discard parseFlagDirective(value)
   of dkRpcApp:
     discard parseStringDirective(value)
-  of dkRpcTimeout:
+  of dkRpcTimeout, dkRpcHeaderTimeout:
     discard parseTimeDirective(value)
   DirectiveValue(kind: kind, value: value)
 
@@ -273,6 +283,9 @@ proc applyDirective*(conf: var IsoNimLocConf; dv: DirectiveValue) =
   of dkRpcTimeout:
     conf.rpcTimeoutMs = parseTimeDirective(dv.value)
     conf.rpcTimeoutSet = true
+  of dkRpcHeaderTimeout:
+    conf.rpcHeaderTimeoutMs = parseTimeDirective(dv.value)
+    conf.rpcHeaderTimeoutSet = true
 
 # ----------------------------------------------------------------
 # Merge (same semantics as the C merge_loc_conf)
@@ -315,12 +328,16 @@ proc mergeLocConf*(parent, child: IsoNimLocConf): IsoNimLocConf =
   if not child.rpcTimeoutSet and parent.rpcTimeoutSet:
     result.rpcTimeoutMs = parent.rpcTimeoutMs
     result.rpcTimeoutSet = true
+  if not child.rpcHeaderTimeoutSet and parent.rpcHeaderTimeoutSet:
+    result.rpcHeaderTimeoutMs = parent.rpcHeaderTimeoutMs
+    result.rpcHeaderTimeoutSet = true
 
 proc isValid*(conf: IsoNimLocConf): bool =
   ## Validates the configuration.
   if conf.enabled and conf.rpcEnabled:
     return false  # isonim_ssr and isonim_rpc cannot share a location
-  if conf.rpcEnabled and (conf.rpcMaxBodySize < 0 or conf.rpcTimeoutMs < 0):
+  if conf.rpcEnabled and (conf.rpcMaxBodySize < 0 or conf.rpcTimeoutMs < 0 or
+                          conf.rpcHeaderTimeoutMs < 0):
     return false
   if not conf.enabled:
     return true  # Disabled config is always valid

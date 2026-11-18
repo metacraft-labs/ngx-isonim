@@ -291,6 +291,7 @@ suite "Config - isonim_rpc":
     check c.rpcApp == ""
     check c.rpcMaxBodySize == 1024 * 1024
     check c.rpcTimeoutMs == 60_000
+    check c.rpcHeaderTimeoutMs == 60_000
 
   test "parse_and_apply_rpc_directives":
     var c = defaultLocConf()
@@ -298,7 +299,9 @@ suite "Config - isonim_rpc":
     c.applyDirective(parseDirective(dkRpcApp, "forum"))
     c.applyDirective(parseDirective(dkRpcMaxBodySize, "1100k"))
     c.applyDirective(parseDirective(dkRpcTimeout, "30s"))
+    c.applyDirective(parseDirective(dkRpcHeaderTimeout, "15s"))
     check c.rpcEnabled and c.rpcEnabledSet
+    check c.rpcHeaderTimeoutMs == 15_000 and c.rpcHeaderTimeoutSet
     check c.rpcApp == "forum"
     check c.rpcMaxBodySize == 1100 * 1024
     check c.rpcTimeoutMs == 30_000
@@ -328,3 +331,13 @@ suite "Config - isonim_rpc":
     check merged.rpcApp == "forum"
     check merged.rpcMaxBodySize == 2048
     check merged.rpcTimeoutMs == 5000
+
+  test "rpc_header_timeout_inherits_and_validates":
+    var parent = parseRpcLocConf(timeoutMs = 0)
+    parent.applyDirective(parseDirective(dkRpcHeaderTimeout, "20s"))
+    let merged = mergeLocConf(parent, defaultLocConf())
+    check merged.rpcHeaderTimeoutMs == 20_000 and merged.rpcHeaderTimeoutSet
+    var bad = parseRpcLocConf()
+    bad.rpcHeaderTimeoutMs = -1
+    check not bad.isValid
+    expect ConfigError: discard parseDirective(dkRpcHeaderTimeout, "soon")

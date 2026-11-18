@@ -81,6 +81,7 @@ type
     done*: bool            ## the response was ended (or the request failed)
     gone*: bool            ## nginx released the request
     timedOut*: bool
+    timeoutName: string    ## the directive whose timer expired (`timeout`)
     failure: ref CatchableError
       ## A write or flush that failed (the client went away, the limit):
       ## the response cannot be completed normally any more.
@@ -107,7 +108,7 @@ proc checkLive(st: RpcState) =
   if st.done:
     raise newException(ClientConnectionError,
       "the response was already ended" &
-      (if st.timedOut: " (isonim_rpc_timeout)" else: ""))
+      (if st.timedOut: " (" & st.timeoutName & ")" else: ""))
   if st.failure != nil:
     raise st.failure
 
@@ -228,18 +229,21 @@ proc complete(st: RpcState; fut: Future[void]) =
       $st.ctx.failure.name & ": " & st.ctx.failure.msg & st.where)
   st.deliver()
 
-proc timeout*(st: RpcState) =
-  ## `isonim_rpc_timeout` expired before the handler completed.
+proc timeout*(st: RpcState; header = false) =
+  ## `isonim_rpc_timeout` expired before the handler completed, or with
+  ## `header`, `isonim_rpc_header_timeout` before it sent its response
+  ## header; the log names the directive whose timer it was.
   if st.ended:
     return
   st.done = true
   st.timedOut = true
+  st.timeoutName = if header: "isonim_rpc_header_timeout" else: "isonim_rpc_timeout"
   if st.transport.committed:
     st.terminate(NGX_LOG_ERR,
-      "the handler did not complete within isonim_rpc_timeout")
+      "the handler did not complete within " & st.timeoutName)
     return
   st.sink.log(NGX_LOG_ERR, "the handler did not complete within " &
-    "isonim_rpc_timeout; responding 504" & st.where)
+    st.timeoutName & "; responding 504" & st.where)
   st.fail(504, "timeout")
   st.deliver()
 

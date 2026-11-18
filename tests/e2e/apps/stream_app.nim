@@ -56,6 +56,18 @@ proc registerStreamApps*() =
     body.write("<p id=\"rest\">rest:" & got & "</p></body></html>")
     body.flush())
 
+  registerAsyncApp("await_before_header", proc(ctx: RequestContext): Future[void] {.async.} =
+    # Nothing of the response before a byte arrives on a socket the test
+    # holds: a request in flight before its header (test_reload_inflight.nim).
+    let port = parseInt(ctx.request.queryParam("port", "0"))
+    let sock = newAsyncSocket()
+    await sock.connect("127.0.0.1", Port(port))
+    let got = await sock.recv(1)
+    sock.close()
+    let body = ctx.bodyWriter
+    body.write("answered:" & got)
+    body.flush())
+
   registerAsyncApp("stream_whole", proc(ctx: RequestContext): Future[void] {.async.} =
     let body = ctx.bodyWriter
     ctx.response.setHeader("X-Stream-App", "whole")

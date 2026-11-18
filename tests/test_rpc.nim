@@ -192,6 +192,18 @@ suite "isonim_rpc - timeout, release, concurrency":
     check r.response.sends.len == 1
     check "late" notin r.response.body
 
+  test "isonim_rpc_header_timeout's expiry names its own directive":
+    # The C module's timer is the header timeout where isonim_rpc_timeout
+    # is 0; its expiry calls the same timeout with `header`.
+    let r = startRpcRecorded(post(slowEchoUrl, """{"ms": 300, "s": "late"}"""))
+    sleepAsync(50).addCallback(proc() {.gcsafe.} =
+      {.cast(gcsafe).}: r.state.timeout(header = true))
+    while not r.finished: poll(10)
+    check r.response.status == 504
+    check r.logged("the handler did not complete within isonim_rpc_header_timeout; responding 504")
+    check not r.logged("within isonim_rpc_timeout")
+    while hasPendingOperations(): poll(10)
+
   test "a request nginx released is never answered":
     let r = startRpcRecorded(post(slowEchoUrl, """{"ms": 50, "s": "x"}"""))
     r.state.release()

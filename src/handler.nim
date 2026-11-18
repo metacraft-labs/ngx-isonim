@@ -329,7 +329,7 @@ else:
       ngx_http_isonim_finalize(r, NGX_HTTP_INTERNAL_SERVER_ERROR)
     pump()
 
-  proc nimRpcTimeout*(state: pointer) {.exportc: "nim_rpc_timeout", cdecl.} =
+  proc nimRpcTimeout*(state: pointer; header: NgxInt) {.exportc: "nim_rpc_timeout", cdecl.} =
     ## `timeout` answers 504 and finalizes the request, which can destroy
     ## its pool: the pool cleanup (`nimRpcReleased`) then drops the C
     ## side's reference to the state while `timeout` is still running on
@@ -338,7 +338,7 @@ else:
     let st = cast[RpcState](state)
     GC_ref(st)
     try:
-      st.timeout()
+      st.timeout(header = header != 0)
     except Exception as e:
       discard e     # nothing may escape into nginx's C frames
     finally:

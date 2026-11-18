@@ -13,7 +13,11 @@
 # the plain round trip; and the streamed responses of async apps
 # (test_async_streaming.nim: a terminated response after the commit point,
 # the timeout after it, slow clients drained by the module's write handler,
-# clients that disconnect mid-body).  Fails if ASan reports anything.  The
+# clients that disconnect mid-body); and graceful reloads with requests in
+# flight (test_reload_inflight.nim: the isonim_rpc_header_timeout timer
+# firing and its 504 finalize in an exiting worker, a request answered by an
+# exiting worker, a client gone before the header while its worker exits, a
+# stream past its header across a reload).  Fails if ASan reports anything.  The
 # falsifying mutations are not run here (they build release modules).
 #
 # Debug build with -d:useMalloc, so that Nim's own objects are malloc'd and
@@ -73,6 +77,13 @@ PATH="${WORK}/bin:${PATH}" NGX_ISONIM_E2E_MODULE="${MODULE}" \
   "${ROOT}/build/e2e/test_async_streaming_asan" \
     "the shell is*" "a handler that never*" "negative control*" "HEAD*" \
     "50 slow clients*" "no alert*"
+
+nim c --hints:off -o:"${ROOT}/build/e2e/test_reload_inflight_asan" \
+  "${ROOT}/tests/e2e/test_reload_inflight.nim" \
+  >"${WORK}/test-build.log" 2>&1 || { tail -40 "${WORK}/test-build.log"; exit 1; }
+
+PATH="${WORK}/bin:${PATH}" NGX_ISONIM_E2E_MODULE="${MODULE}" \
+  "${ROOT}/build/e2e/test_reload_inflight_asan" "test_*"
 
 if find "${WORK}" -maxdepth 1 -name 'asan*' | grep -q .; then
   echo "AddressSanitizer reported:" >&2
